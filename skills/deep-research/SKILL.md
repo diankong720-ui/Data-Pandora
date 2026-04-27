@@ -441,6 +441,11 @@ Forbidden actions:
 - do not invent missing semantics for an underspecified chart
 - do not assume `report.md` always uses Chinese or always uses English
 - do not depend on fixed runtime-owned section titles when preparing chart/report-facing text
+- when chart rendering needs result rows that were lost or purged, prefer
+  `render-charts --rehydrate-missing-result-rows --client-factory ...`; the
+  runtime may restore only referenced query rows from cache or by re-executing
+  the original contract query, and failed restoration degrades to audited chart
+  omission rather than blocking report delivery
 
 Completion gate:
 

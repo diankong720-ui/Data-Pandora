@@ -36,6 +36,9 @@ It is a reporting stage, not a research stage.
 
 - validate structured chart specs authored by the LLM
 - consume only already-executed and already-persisted session evidence
+- when explicitly requested through the runtime bridge, let runtime rehydrate
+  missing chart source rows from cache or by re-executing only the original
+  chart-referenced contract query
 - render the LLM-authored high-level `plot_spec` directly, without inferring chart type, field roles, or transform intent
 - generate descriptive statistics summaries
 - generate chart files, plot-data snapshots, and captions
@@ -50,6 +53,23 @@ It is a reporting stage, not a research stage.
 - do not create conclusions beyond the already-persisted final answer and report evidence
 - do not force chart output when evidence is weak or irrelevant
 - do not guess business semantics, chart type, field roles, or transform logic when a chart spec is under-specified
+
+## Runtime Row Rehydration
+
+For a requested charted report, use:
+
+```bash
+python3 scripts/deep_research_runtime.py render-charts \
+  --slug <slug> \
+  --session-id <session_id> \
+  --rehydrate-missing-result-rows \
+  --client-factory <factory>
+```
+
+This does not authorize new analysis. Runtime may only restore rows for
+`chart_spec_bundle.specs[*].source_query_ref` from cache or from the original
+frozen contract query. If restoration fails, runtime records the omission in
+`descriptive_stats.json` and continues report delivery.
 
 ## Chart Admission Rules
 

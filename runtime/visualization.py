@@ -14,8 +14,10 @@ from runtime.contracts import (
     stable_payload_hash,
     validate_chart_spec_bundle,
     validate_descriptive_stats_bundle,
+    validate_query_execution_request,
     validate_visualization_manifest,
 )
+from runtime.cache import load_cached_rows
 from runtime.persistence import (
     get_session_context,
     load_session_evidence,
@@ -24,6 +26,7 @@ from runtime.persistence import (
     persist_binary_artifact,
     persist_round_bundle,
 )
+from runtime.tools import apply_result_row_retention, execute_query_request
 from runtime.visualization_capabilities import RENDER_ENGINE_ID, SUPPORTED_CHART_TYPES
 
 USABLE_QUERY_STATUSES = {"success", "cached", "degraded_to_cache"}
@@ -506,10 +509,367 @@ def _purge_rendered_result_rows(
     return cleanup_results
 
 
+def _round_id_for_bundle(bundle: dict[str, Any]) -> str | None:
+    evaluation = bundle.get("evaluation")
+    round_id = evaluation.get("round_id") if isinstance(evaluation, dict) else None
+    if isinstance(round_id, str) and round_id:
+        return round_id
+    contract = bundle.get("contract")
+    round_number = contract.get("round_number") if isinstance(contract, dict) else None
+    if isinstance(round_number, int) and round_number > 0:
+        return f"round_{round_number}"
+    return None
+
+
+def _find_contract_query(bundle: dict[str, Any], query_id: str) -> dict[str, Any] | None:
+    contract = bundle.get("contract")
+    queries = contract.get("queries") if isinstance(contract, dict) else None
+    if not isinstance(queries, list):
+        return None
+    for query in queries:
+        if isinstance(query, dict) and query.get("query_id") == query_id:
+            return query
+    return None
+
+
+def _replace_executed_query(
+    bundle: dict[str, Any],
+    query_id: str,
+    updated_query: dict[str, Any],
+) -> list[dict[str, Any]]:
+    replaced: list[dict[str, Any]] = []
+    for query in bundle.get("executed_queries", []):
+        if isinstance(query, dict) and query.get("query_id") == query_id:
+            replaced.append(updated_query)
+        elif isinstance(query, dict):
+            replaced.append(query)
+    return replaced
+
+
+def _persist_rehydrated_query(
+    slug: str,
+    bundle: dict[str, Any],
+    round_id: str,
+    query_id: str,
+    updated_query: dict[str, Any],
+    *,
+    session_id: str | None,
+) -> None:
+    contract = bundle.get("contract") if isinstance(bundle.get("contract"), dict) else {}
+    evaluation = bundle.get("evaluation") if isinstance(bundle.get("evaluation"), dict) else {}
+    updated_queries = _replace_executed_query(bundle, query_id, updated_query)
+    bundle["executed_queries"] = updated_queries
+    persist_round_bundle(
+        slug,
+        round_id,
+        contract,
+        updated_queries,
+        evaluation,
+        generation_id=str(bundle.get("generation_id")) if isinstance(bundle.get("generation_id"), str) else None,
+        session_id=session_id,
+        strict_session=bool(session_id),
+    )
+
+
+def _clear_stale_retention_cleanup_fields(query: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(query)
+    cleaned.pop("result_rows_purged_at", None)
+    cleaned.pop("retention_cleanup_status", None)
+    return cleaned
+
+
+def _rehydration_failure(round_id: str, query_id: str, reason: str) -> dict[str, Any]:
+    return {
+        "round_id": round_id,
+        "query_id": query_id,
+        "status": "failed",
+        "reason": reason,
+    }
+
+
+def _exception_reason(prefix: str, exc: Exception) -> str:
+    message = str(exc).strip()
+    if len(message) > 300:
+        message = message[:300] + "..."
+    return f"{prefix}: {type(exc).__name__}{f': {message}' if message else ''}"
+
+
+def _rehydrate_missing_chart_result_rows(
+    slug: str,
+    chart_spec_bundle: dict[str, Any],
+    *,
+    client: Any | None,
+    session_id: str | None,
+    timeout: float,
+    max_rows: int,
+    max_cache_age_seconds: float | None,
+) -> list[dict[str, Any]]:
+    source_refs: list[tuple[str, str]] = []
+    seen_refs: set[tuple[str, str]] = set()
+    for spec in chart_spec_bundle.get("specs", []):
+        if not isinstance(spec, dict):
+            continue
+        source_ref = spec.get("source_query_ref")
+        if not isinstance(source_ref, dict):
+            continue
+        round_id = source_ref.get("round_id")
+        query_id = source_ref.get("query_id")
+        if isinstance(round_id, str) and isinstance(query_id, str):
+            key = (round_id, query_id)
+            if key not in seen_refs:
+                source_refs.append(key)
+                seen_refs.add(key)
+
+    if not source_refs:
+        return []
+    if max_rows <= 0:
+        return [
+            _rehydration_failure(
+                round_id,
+                query_id,
+                "max_rows must be a positive integer for result row rehydration",
+            )
+            for round_id, query_id in source_refs
+        ]
+
+    round_bundles = list_round_bundles(
+        slug,
+        session_id=session_id,
+        strict_session=bool(session_id),
+    )
+    bundles_by_round_id = {
+        round_id: bundle
+        for bundle in round_bundles
+        if isinstance(bundle, dict)
+        for round_id in [_round_id_for_bundle(bundle)]
+        if isinstance(round_id, str)
+    }
+
+    results: list[dict[str, Any]] = []
+    for round_id, query_id in source_refs:
+        bundle = bundles_by_round_id.get(round_id)
+        if not isinstance(bundle, dict):
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "source round bundle is not available for rehydration",
+                }
+            )
+            continue
+
+        query_record = next(
+            (
+                query
+                for query in bundle.get("executed_queries", [])
+                if isinstance(query, dict) and query.get("query_id") == query_id
+            ),
+            None,
+        )
+        if not isinstance(query_record, dict):
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "source query record is not available for rehydration",
+                }
+            )
+            continue
+        if query_record.get("result_rows_persisted") is True and isinstance(query_record.get("result_rows"), list):
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "already_available",
+                    "reason": "source query result rows are already retained",
+                }
+            )
+            continue
+
+        contract_query = _find_contract_query(bundle, query_id)
+        if not isinstance(contract_query, dict):
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "source contract query is not available for rehydration",
+                }
+            )
+            continue
+        sql = contract_query.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "source contract query sql is not available for rehydration",
+                }
+            )
+            continue
+        if client is None:
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "rehydration requested but no warehouse client was provided",
+                }
+            )
+            continue
+
+        now = time.time()
+        runtime_request = dict(contract_query)
+        runtime_request["persist_result_rows"] = True
+        try:
+            validate_query_execution_request(runtime_request)
+        except Exception as exc:
+            results.append(
+                _rehydration_failure(
+                    round_id,
+                    query_id,
+                    _exception_reason("source contract query validation failed", exc),
+                )
+            )
+            continue
+        try:
+            warehouse_identity = client.identity
+        except Exception as exc:
+            results.append(
+                _rehydration_failure(
+                    round_id,
+                    query_id,
+                    _exception_reason("warehouse client identity failed", exc),
+                )
+            )
+            continue
+        try:
+            cached_rows = load_cached_rows(
+                warehouse_identity,
+                sql,
+                max_age_seconds=max_cache_age_seconds,
+            )
+        except Exception as exc:
+            results.append(
+                _rehydration_failure(
+                    round_id,
+                    query_id,
+                    _exception_reason("cache rehydration failed", exc),
+                )
+            )
+            continue
+        if isinstance(cached_rows, list):
+            retained_rows, retention_metadata, retention_denial_reason = apply_result_row_retention(
+                runtime_request,
+                cached_rows,
+                warehouse_identity=warehouse_identity,
+                temporary_full_rows_max=max_rows,
+            )
+            if not isinstance(retained_rows, list):
+                reason = retention_denial_reason or (
+                    "runtime retention policy did not allow cached result rows "
+                    f"(mode={retention_metadata.get('retention_mode_applied')})"
+                )
+                results.append(_rehydration_failure(round_id, query_id, reason))
+                continue
+            source_result_hash = stable_payload_hash(retained_rows)
+            updated_query = {
+                **_clear_stale_retention_cleanup_fields(query_record),
+                "result_rows": retained_rows,
+                "result_rows_persisted": True,
+                **retention_metadata,
+                "source_result_hash": source_result_hash,
+                "rehydrated_at": now,
+                "rehydration_source": "cache",
+                "rehydration_reason": "chart_render_missing_result_rows",
+            }
+            _persist_rehydrated_query(slug, bundle, round_id, query_id, updated_query, session_id=session_id)
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "recovered",
+                    "source": "cache",
+                    "row_count": len(retained_rows),
+                    "source_result_hash": source_result_hash,
+                }
+            )
+            continue
+
+        contract = bundle.get("contract") if isinstance(bundle.get("contract"), dict) else {}
+        try:
+            live_result = execute_query_request(
+                client,
+                runtime_request,
+                slug=slug,
+                session_id=session_id,
+                contract_id=str(contract.get("contract_id") or ""),
+                round_number=int(contract.get("round_number") or 0),
+                timeout=timeout,
+                max_rows=max_rows,
+                max_cache_age_seconds=max_cache_age_seconds,
+                temporary_full_rows_max=max_rows,
+            )
+        except Exception as exc:
+            results.append(
+                _rehydration_failure(
+                    round_id,
+                    query_id,
+                    _exception_reason("live rehydration failed", exc),
+                )
+            )
+            continue
+        if (
+            live_result.get("status") in USABLE_QUERY_STATUSES
+            and live_result.get("result_rows_persisted") is True
+            and isinstance(live_result.get("result_rows"), list)
+        ):
+            retained_rows = live_result["result_rows"]
+            source_result_hash = stable_payload_hash(retained_rows)
+            updated_query = {
+                **_clear_stale_retention_cleanup_fields(query_record),
+                **live_result,
+                "source_result_hash": source_result_hash,
+                "rehydrated_at": now,
+                "rehydration_source": "live",
+                "rehydration_reason": "chart_render_missing_result_rows",
+            }
+            _persist_rehydrated_query(slug, bundle, round_id, query_id, updated_query, session_id=session_id)
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "recovered",
+                    "source": "live",
+                    "row_count": len(retained_rows),
+                    "source_result_hash": source_result_hash,
+                }
+            )
+        else:
+            results.append(
+                {
+                    "round_id": round_id,
+                    "query_id": query_id,
+                    "status": "failed",
+                    "reason": "; ".join(str(note) for note in live_result.get("notes", []) if note)
+                    or str(live_result.get("status") or "live rehydration did not retain result rows"),
+                }
+            )
+    return results
+
+
 def render_chart_artifacts(
     slug: str,
     *,
+    client: Any | None = None,
     session_id: str | None = None,
+    rehydrate_missing_result_rows: bool = False,
+    timeout: float = 30.0,
+    max_rows: int = 10_000,
+    max_cache_age_seconds: float | None = None,
 ) -> dict[str, Any]:
     session_evidence = load_session_evidence(slug, session_id=session_id, strict_session=bool(session_id))
     session_context = get_session_context(slug, session_id=session_id, strict_session=bool(session_id))
@@ -518,13 +878,40 @@ def render_chart_artifacts(
         raise ValueError("chart_spec_bundle.json is required before chart rendering.")
     validate_chart_spec_bundle(chart_spec_bundle)
 
+    rehydration_results: list[dict[str, Any]] = []
+    if rehydrate_missing_result_rows:
+        rehydration_results = _rehydrate_missing_chart_result_rows(
+            slug,
+            chart_spec_bundle,
+            client=client,
+            session_id=session_id,
+            timeout=timeout,
+            max_rows=max_rows,
+            max_cache_age_seconds=max_cache_age_seconds,
+        )
+        if any(result.get("status") == "recovered" for result in rehydration_results):
+            session_evidence = load_session_evidence(slug, session_id=session_id, strict_session=bool(session_id))
+            chart_spec_bundle = session_evidence.get("chart_spec_bundle")
+            if not isinstance(chart_spec_bundle, dict):
+                raise ValueError("chart_spec_bundle.json is required before chart rendering.")
+            validate_chart_spec_bundle(chart_spec_bundle)
+    rehydration_failures = {
+        (str(result.get("round_id")), str(result.get("query_id"))): result
+        for result in rehydration_results
+        if result.get("status") == "failed"
+    }
+
     query_records = _query_records(session_evidence)
     evidence_by_ref, query_to_evidence_refs = _report_evidence_maps(session_evidence)
 
     summaries: list[dict[str, Any]] = []
     omitted_visuals: list[dict[str, Any]] = []
     charts: list[dict[str, Any]] = []
-    query_source_hashes_for_cleanup: dict[tuple[str, str], str] = {}
+    query_source_hashes_for_cleanup: dict[tuple[str, str], str] = {
+        (str(result["round_id"]), str(result["query_id"])): str(result["source_result_hash"])
+        for result in rehydration_results
+        if result.get("status") == "recovered" and isinstance(result.get("source_result_hash"), str)
+    }
 
     for spec in chart_spec_bundle["specs"]:
         spec_id = str(spec["spec_id"])
@@ -538,6 +925,9 @@ def render_chart_artifacts(
             reason = "source query status is not eligible for chart rendering"
         elif not query_record.get("result_rows_persisted") or not isinstance(query_record.get("result_rows"), list):
             reason = "source query result rows were not retained for rendering"
+            rehydration_failure = rehydration_failures.get(query_ref_key)
+            if isinstance(rehydration_failure, dict) and rehydration_failure.get("reason"):
+                reason = f"{reason}; {rehydration_failure['reason']}"
         else:
             for evidence_ref in spec["evidence_refs"]:
                 if evidence_ref not in evidence_by_ref:
@@ -651,6 +1041,12 @@ def render_chart_artifacts(
         "statistical_summary": summaries,
         "omitted_visuals": omitted_visuals,
         "omission_reasons": omission_reasons,
+        "rehydration": {
+            "attempted": bool(rehydrate_missing_result_rows),
+            "results": rehydration_results,
+            "recovered_count": sum(1 for result in rehydration_results if result.get("status") == "recovered"),
+            "failed_count": sum(1 for result in rehydration_results if result.get("status") == "failed"),
+        },
         "retention_cleanup": retention_cleanup,
         "generated_at": time.time(),
     }
@@ -668,6 +1064,7 @@ def render_chart_artifacts(
         "session_id": session_evidence.get("session_id") or "legacy",
         "report_path": str(Path(session_context["session_root"]) / "report.md"),
         "charts": charts,
+        "rehydration": descriptive_stats["rehydration"],
         "generated_at": time.time(),
     }
     validate_visualization_manifest(visualization_manifest)

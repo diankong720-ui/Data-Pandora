@@ -1116,9 +1116,14 @@ def persist_chart_spec_stage(
 def persist_chart_render_stage(
     slug: str,
     *,
+    client: Any | None = None,
     action_rationale: dict[str, Any] | None = None,
     session_mode: str = SESSION_MODE_ORCHESTRATED_ONLY,
     session_id: str | None = None,
+    rehydrate_missing_result_rows: bool = False,
+    timeout: float = 30.0,
+    max_rows: int = 10_000,
+    max_cache_age_seconds: float | None = None,
 ) -> dict[str, Any]:
     require_orchestrated_entry(session_mode)
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
@@ -1147,7 +1152,15 @@ def persist_chart_render_stage(
         why_not_a_later_stage_claim="This action materializes charts from persisted evidence but does not create report prose or new claims.",
     )
     append_action_rationale(slug, rationale, session_id=session_id)
-    bundle = render_chart_artifacts(slug, session_id=session_id)
+    bundle = render_chart_artifacts(
+        slug,
+        client=client,
+        session_id=session_id,
+        rehydrate_missing_result_rows=rehydrate_missing_result_rows,
+        timeout=timeout,
+        max_rows=max_rows,
+        max_cache_age_seconds=max_cache_age_seconds,
+    )
     validate_descriptive_stats_bundle(bundle["descriptive_stats"])
     validate_visualization_manifest(bundle["visualization_manifest"])
     complete_stage(

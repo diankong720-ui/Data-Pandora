@@ -38,6 +38,17 @@ CONCLUSION_STATES = {
     "restart_required",
     "blocked_runtime",
 }
+
+RETENTION_FIELDS_TO_PRESERVE = (
+    "result_rows",
+    "result_rows_persisted",
+    "retention_mode_applied",
+    "sensitivity_class",
+    "redaction_profile",
+    "source_result_hash",
+    "result_rows_purged_at",
+    "retention_cleanup_status",
+)
 INCOMPLETENESS_CATEGORIES = {
     "",
     "warehouse_load",
@@ -242,6 +253,61 @@ def validate_round_evaluation_result(
         )
 
 
+def _preserve_query_retention_state(
+    incoming_queries: list[dict[str, Any]],
+    existing_queries: list[Any],
+) -> list[dict[str, Any]]:
+    existing_by_query_id = {
+        query.get("query_id"): query
+        for query in existing_queries
+        if isinstance(query, dict) and isinstance(query.get("query_id"), str)
+    }
+    merged_queries: list[dict[str, Any]] = []
+    for incoming in incoming_queries:
+        if not isinstance(incoming, dict):
+            merged_queries.append(incoming)
+            continue
+        merged = dict(incoming)
+        query_id = merged.get("query_id")
+        existing = existing_by_query_id.get(query_id)
+        if not isinstance(existing, dict):
+            merged_queries.append(merged)
+            continue
+
+        existing_rows_were_purged = (
+            existing.get("retention_cleanup_status") == "purged_after_chart_render"
+            or "result_rows_purged_at" in existing
+        )
+        if existing_rows_were_purged:
+            for field in (
+                "result_rows_persisted",
+                "source_result_hash",
+                "result_rows_purged_at",
+                "retention_cleanup_status",
+            ):
+                if field in existing:
+                    merged[field] = existing[field]
+            merged.pop("result_rows", None)
+            merged_queries.append(merged)
+            continue
+
+        existing_rows_are_retained = (
+            existing.get("result_rows_persisted") is True
+            and isinstance(existing.get("result_rows"), list)
+        )
+        incoming_rows_are_retained = (
+            merged.get("result_rows_persisted") is True
+            and isinstance(merged.get("result_rows"), list)
+        )
+        if existing_rows_are_retained and not incoming_rows_are_retained:
+            for field in RETENTION_FIELDS_TO_PRESERVE:
+                if field in existing:
+                    merged[field] = existing[field]
+
+        merged_queries.append(merged)
+    return merged_queries
+
+
 def persist_round_evaluation(
     slug: str,
     evaluation: dict[str, Any],
@@ -275,6 +341,11 @@ def persist_round_evaluation(
         raise ValueError("persist_round_evaluation requires a contract or an existing round bundle.")
     if not isinstance(executed_queries, list):
         raise ValueError("persist_round_evaluation requires executed_queries or an existing round bundle.")
+    if isinstance(existing_bundle, dict) and isinstance(existing_bundle.get("executed_queries"), list):
+        executed_queries = _preserve_query_retention_state(
+            executed_queries,
+            existing_bundle["executed_queries"],
+        )
 
     validate_round_evaluation_result(
         evaluation,

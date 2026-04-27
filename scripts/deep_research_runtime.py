@@ -34,6 +34,13 @@ def _read_json(path: str | Path) -> Any:
         return json.load(handle)
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _merge_policy(base: dict[str, Any], update: dict[str, Any] | None) -> dict[str, Any]:
     merged = dict(base)
     for key, value in (update or {}).items():
@@ -327,10 +334,16 @@ def cmd_persist_chart_spec(args: argparse.Namespace) -> None:
 def cmd_render_charts(args: argparse.Namespace) -> None:
     runtime = _load_runtime()
     _configure_runtime_policy(runtime, args)
+    client = _resolve_factory(args.client_factory) if args.client_factory else None
     bundle = runtime.persist_chart_render_stage(
         args.slug,
+        client=client,
         session_mode=runtime.SESSION_MODE_ORCHESTRATED_ONLY,
         session_id=args.session_id,
+        rehydrate_missing_result_rows=args.rehydrate_missing_result_rows,
+        timeout=args.timeout,
+        max_rows=args.max_rows,
+        max_cache_age_seconds=args.max_cache_age_seconds,
     )
     _emit({"status": "ok", "bundle": bundle})
 
@@ -441,6 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     render_charts = subparsers.add_parser("render-charts", help="Render chart artifacts from chart_spec_bundle.json.")
     _add_session_args(render_charts)
+    render_charts.add_argument("--client-factory")
+    render_charts.add_argument("--rehydrate-missing-result-rows", action="store_true")
+    render_charts.add_argument("--timeout", type=float, default=30.0)
+    render_charts.add_argument("--max-rows", type=_positive_int, default=10_000)
+    render_charts.add_argument("--max-cache-age-seconds", type=float)
     render_charts.set_defaults(func=cmd_render_charts)
 
     assemble_report = subparsers.add_parser("assemble-report", help="Assemble report.md and compliance artifacts.")

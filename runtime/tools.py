@@ -175,6 +175,49 @@ def _resolve_result_row_retention(
     return "preview_only", None, "row retention denied by runtime policy"
 
 
+def apply_result_row_retention(
+    request: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    warehouse_identity: str,
+    temporary_full_rows_max: int | None = None,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any], str | None]:
+    """
+    Apply the same runtime-owned row-retention rules used by live execution.
+
+    Returns retained rows when policy allows local row persistence, retention
+    metadata for audit, and an optional denial reason.
+    """
+    retention_mode, retention_policy, retention_denial_reason = _resolve_result_row_retention(
+        request,
+        warehouse_identity=warehouse_identity,
+        temporary_full_rows_max=temporary_full_rows_max,
+    )
+    retained_rows: list[dict[str, Any]] | None = None
+    if retention_mode == "full_rows":
+        retained_rows = list(rows)
+    elif retention_mode == "redacted_rows":
+        retained_rows = _redact_rows(
+            list(rows),
+            retention_policy.get("redaction_profile") if retention_policy else None,
+        )
+    if isinstance(retained_rows, list):
+        max_rows_for_retention = retention_policy.get("max_rows") if isinstance(retention_policy, dict) else None
+        if isinstance(max_rows_for_retention, int) and max_rows_for_retention > 0:
+            retained_rows = retained_rows[:max_rows_for_retention]
+    metadata = {
+        "retention_mode_applied": retention_mode,
+        "sensitivity_class": (
+            str(retention_policy.get("sensitivity_class"))
+            if isinstance(retention_policy, dict)
+            else "unspecified"
+        ),
+    }
+    if isinstance(retention_policy, dict) and isinstance(retention_policy.get("redaction_profile"), dict):
+        metadata["redaction_profile"] = dict(retention_policy["redaction_profile"])
+    return retained_rows, metadata, retention_denial_reason
+
+
 def _strip_sql_comments(sql: str) -> str:
     sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
     return re.sub(r'--[^\n]*', ' ', sql)
@@ -372,27 +415,18 @@ def execute_query_request(
         warehouse_identity=client.identity,
         temporary_full_rows_max=temporary_full_rows_max,
     )
-    retained_rows: list[dict[str, Any]] | None = None
-    if retention_mode == "full_rows":
-        retained_rows = list(detailed["result_rows"])
-    elif retention_mode == "redacted_rows":
-        retained_rows = _redact_rows(list(detailed["result_rows"]), retention_policy.get("redaction_profile") if retention_policy else None)
+    retained_rows, retention_metadata, retention_denial_reason = apply_result_row_retention(
+        request,
+        list(detailed["result_rows"]),
+        warehouse_identity=client.identity,
+        temporary_full_rows_max=temporary_full_rows_max,
+    )
     if isinstance(retained_rows, list):
-        max_rows_for_retention = retention_policy.get("max_rows") if isinstance(retention_policy, dict) else None
-        if isinstance(max_rows_for_retention, int) and max_rows_for_retention > 0:
-            retained_rows = retained_rows[:max_rows_for_retention]
         result["result_rows"] = retained_rows
         result["result_rows_persisted"] = True
     else:
         result["result_rows_persisted"] = False
-    result["retention_mode_applied"] = retention_mode
-    result["sensitivity_class"] = (
-        str(retention_policy.get("sensitivity_class"))
-        if isinstance(retention_policy, dict)
-        else "unspecified"
-    )
-    if isinstance(retention_policy, dict) and isinstance(retention_policy.get("redaction_profile"), dict):
-        result["redaction_profile"] = dict(retention_policy["redaction_profile"])
+    result.update(retention_metadata)
     if retention_denial_reason:
         result["notes"].append(retention_denial_reason)
     cache_write_rows: list[dict[str, Any]] | None = None
