@@ -1,0 +1,18 @@
+# Deep Research Skill — Runtime Dependencies
+#
+# The core runtime is mostly stdlib. Stage 7 chart rendering uses matplotlib
+# and will attempt to install it automatically at render time if missing.
+# You may preinstall it in locked environments:
+# matplotlib>=3.8
+
+# --- HttpSqlClient (runtime/example_clients/http_sql_client.py) ---
+# requests>=2.28.0
+# python-dotenv>=1.0.0
+
+# --- SqlAlchemyClient (runtime/example_clients/http_sql_client.py) ---
+# sqlalchemy>=2.0.0
+#
+# Plus one driver for your database:
+#   psycopg2-binary>=2.9     # PostgreSQL
+#   pymysql>=1.1             # MySQL / MariaDB
+#   sqlalchemy-bigquery>=1.9 # BigQuery

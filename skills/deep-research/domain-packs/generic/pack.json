@@ -1,0 +1,140 @@
+{
+  "pack_id": "generic",
+  "label": "Generic BI Research Pack",
+  "description": "Language-agnostic fallback pack. Works for any SQL-queryable business domain. Replace with a domain-specific pack to improve intent recognition accuracy.",
+  "taxonomy": {
+    "problem_types": [
+      {
+        "id": "metric_read",
+        "label": "Metric Read",
+        "summary": "Read a single trusted metric for a given period.",
+        "keywords": ["how much", "what was", "total", "amount", "count", "revenue", "sales"]
+      },
+      {
+        "id": "trend_comparison",
+        "label": "Trend Comparison",
+        "summary": "Compare a metric across periods.",
+        "keywords": ["compared to", "vs", "change", "trend", "MoM", "YoY", "growth", "decline"]
+      },
+      {
+        "id": "anomaly_root_cause",
+        "label": "Root Cause",
+        "summary": "Diagnose the likely cause of a metric change.",
+        "keywords": ["why", "reason", "root cause", "dropped", "fell", "increased", "spike", "dip"]
+      },
+      {
+        "id": "segment_contribution",
+        "label": "Segment Contribution",
+        "summary": "Break a change into segment-level contributions.",
+        "keywords": ["contribution", "breakdown", "segment", "attribution", "split by"]
+      },
+      {
+        "id": "structure_analysis",
+        "label": "Structure Analysis",
+        "summary": "Analyze the distribution or mix across supported dimensions.",
+        "keywords": ["structure", "mix", "distribution", "share", "proportion", "composition", "breakdown"]
+      },
+      {
+        "id": "fulfillment_impact",
+        "label": "Fulfillment Impact",
+        "summary": "Assess whether operational/fulfillment factors explain the metric change.",
+        "keywords": ["fulfillment", "inventory", "replenishment", "supply", "delivery", "stock"]
+      },
+      {
+        "id": "report_consistency_audit",
+        "label": "Report Audit",
+        "summary": "Audit a report figure against live data.",
+        "keywords": ["report", "inconsistent", "mismatch", "discrepancy", "verify", "audit", "check"]
+      },
+      {
+        "id": "data_feasibility_check",
+        "label": "Feasibility",
+        "summary": "Check whether the request is supported by available data.",
+        "keywords": ["can we", "is it possible", "do we have data", "available", "supported", "feasible"]
+      }
+    ]
+  },
+  "lexicon": {
+    "metrics": [],
+    "dimensions": [],
+    "business_aliases": [],
+    "unsupported_dimensions": [],
+    "performance_risks": []
+  },
+  "driver_family_templates": {
+    "audit_scope": {
+      "class": "audit",
+      "statement": "The requested change may be explained by business-scope mismatch.",
+      "base_prior": 0.55,
+      "operator": "audit_baseline"
+    },
+    "audit_time_field": {
+      "class": "audit",
+      "statement": "The requested comparison may rely on a mismatched time field or time window.",
+      "base_prior": 0.6,
+      "operator": "audit_baseline"
+    },
+    "audit_business_definition": {
+      "class": "audit",
+      "statement": "The requested view may rely on a mismatched business definition.",
+      "base_prior": 0.45,
+      "operator": "audit_baseline"
+    },
+    "demand_order_shift": {
+      "class": "driver",
+      "statement": "Order volume movement may explain the headline change.",
+      "base_prior": 0.6,
+      "operator": "demand_decomposition"
+    },
+    "demand_buyer_shift": {
+      "class": "driver",
+      "statement": "Buyer/user count movement may explain the headline change.",
+      "base_prior": 0.6,
+      "operator": "demand_decomposition"
+    },
+    "value_aov_shift": {
+      "class": "driver",
+      "statement": "Value per order (AOV) change may explain the headline change.",
+      "base_prior": 0.55,
+      "operator": "value_decomposition"
+    },
+    "value_frequency_shift": {
+      "class": "driver",
+      "statement": "Purchase frequency shift may explain the headline change.",
+      "base_prior": 0.5,
+      "operator": "value_decomposition"
+    },
+    "dimension_channel_mix": {
+      "class": "driver",
+      "statement": "A channel mix shift may explain the headline change.",
+      "base_prior": 0.45,
+      "operator": "dimension_contribution"
+    },
+    "dimension_product_mix": {
+      "class": "driver",
+      "statement": "A product mix shift may explain the headline change.",
+      "base_prior": 0.4,
+      "operator": "dimension_contribution"
+    },
+    "segment_concentration": {
+      "class": "driver",
+      "statement": "Segment concentration may explain the observed structure.",
+      "base_prior": 0.35,
+      "operator": "dimension_contribution"
+    },
+    "fulfillment_impact": {
+      "class": "driver",
+      "statement": "Operational/fulfillment behavior may explain the headline change.",
+      "base_prior": 0.35,
+      "operator": "fulfillment_probe"
+    }
+  },
+  "domain_priors": {},
+  "operator_preferences": {
+    "dimension_priority": ["channel", "product"],
+    "dimension_mode_hints": {
+      "channel": ["mix_delta", "concentration_shift"],
+      "product": ["top_movers", "bounded_compare"]
+    }
+  }
+}
