@@ -18,6 +18,7 @@ from runtime.contracts import (
     validate_visualization_manifest,
 )
 from runtime.cache import load_cached_rows
+from runtime.ephemeral_rows import clear_ephemeral_result_rows, get_ephemeral_result_rows
 from runtime.persistence import (
     get_session_context,
     load_session_evidence,
@@ -30,6 +31,7 @@ from runtime.tools import apply_result_row_retention, execute_query_request
 from runtime.visualization_capabilities import RENDER_ENGINE_ID, SUPPORTED_CHART_TYPES
 
 USABLE_QUERY_STATUSES = {"success", "cached", "degraded_to_cache"}
+MAX_CHART_RENDER_ROWS = 5_000
 REPORT_TEMPLATE_PRESETS: dict[str, dict[str, str]] = {
     "zh-CN": {
         "title": "数据分析报告",
@@ -242,21 +244,28 @@ def _safe_artifact_name_component(value: str, *, fallback: str) -> str:
     return safe or fallback
 
 
-def _validate_plot_data_items(items: list[dict[str, Any]], source_rows: list[dict[str, Any]]) -> None:
+def _plot_item_source_indexes(items: list[dict[str, Any]], source_rows: list[dict[str, Any]]) -> list[int]:
+    if not source_rows:
+        raise ValueError("source query result rows are empty; chart rendering requires at least one row.")
     max_index = len(source_rows) - 1
+    source_indexes: list[int] = []
     for item in items:
-        source_indexes: list[int] = []
+        if not isinstance(item, dict):
+            continue
         single_index = item.get("source_row_index")
         if isinstance(single_index, int):
             source_indexes.append(single_index)
         many_indexes = item.get("source_row_indexes")
         if isinstance(many_indexes, list):
             source_indexes.extend(index for index in many_indexes if isinstance(index, int))
-        if not source_indexes:
-            raise ValueError("Each plot_data item must declare source_row_index or source_row_indexes.")
-        for index in source_indexes:
-            if index < 0 or index > max_index:
-                raise ValueError("plot_data references source rows outside the persisted result set.")
+    if not source_indexes:
+        source_indexes = list(range(len(source_rows)))
+    for index in source_indexes:
+        if index < 0 or index > max_index:
+            raise ValueError("plot_data references source rows outside the available result set.")
+    if len(source_indexes) > MAX_CHART_RENDER_ROWS:
+        raise ValueError("source rows too large; query should pre-aggregate or limit rows")
+    return source_indexes
 
 
 def _load_matplotlib_pyplot() -> Any:
@@ -291,6 +300,71 @@ def _plot_payload_items(plot_data: dict[str, Any]) -> list[dict[str, Any]]:
     return payloads
 
 
+def _plot_spec_render_fields(plot_spec: dict[str, Any]) -> list[str]:
+    chart_type = str(plot_spec.get("chart_type") or "")
+    fields: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip() and value.strip() not in fields:
+            fields.append(value.strip())
+
+    if chart_type in {"line", "bar", "horizontal_bar", "scatter", "area"}:
+        add(plot_spec.get("x_field"))
+        add(plot_spec.get("y_field"))
+        add(plot_spec.get("series_field"))
+    elif chart_type in {"histogram", "box"}:
+        add(plot_spec.get("value_field") or plot_spec.get("y_field") or plot_spec.get("x_field"))
+    elif chart_type == "heatmap":
+        add(plot_spec.get("x_field"))
+        add(plot_spec.get("y_field"))
+        add(plot_spec.get("value_field"))
+    return fields
+
+
+def _materialize_plot_data_from_source_rows(
+    spec: dict[str, Any],
+    source_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    source_items = spec.get("plot_data", {}).get("items", [])
+    if not isinstance(source_items, list):
+        source_items = []
+    source_indexes = _plot_item_source_indexes(source_items, source_rows)
+    fields = _plot_spec_render_fields(spec["plot_spec"])
+    warnings: list[str] = []
+    materialized_items: list[dict[str, Any]] = []
+    for ordinal, source_index in enumerate(source_indexes):
+        row = source_rows[source_index]
+        payload = {field: row[field] for field in fields if field in row}
+        source_item = source_items[ordinal] if ordinal < len(source_items) and isinstance(source_items[ordinal], dict) else {}
+        source_payload = source_item.get("payload") if isinstance(source_item.get("payload"), dict) else {}
+        for field, value in payload.items():
+            if field in source_payload and source_payload[field] != value:
+                warnings.append(
+                    f"plot_data payload for source row {source_index} field {field!r} differed from runtime source rows and was ignored"
+                )
+        materialized_items.append(
+            {
+                "item_id": str(source_item.get("item_id") or f"row_{source_index}"),
+                "source_row_index": source_index,
+                "source_row_hash": stable_payload_hash(row),
+                "payload_origin": "runtime_source_rows",
+                "payload": payload,
+            }
+        )
+    plot_data = {
+        "spec_id": spec["spec_id"],
+        "semantic_chart_type": spec["semantic_chart_type"],
+        "renderer_hint": spec.get("renderer_hint"),
+        "source_query_ref": dict(spec["source_query_ref"]),
+        "items": materialized_items,
+        "plot_spec": dict(spec["plot_spec"]),
+        "payload_origin": "runtime_source_rows",
+    }
+    if warnings:
+        plot_data["payload_warnings"] = warnings
+    return plot_data, warnings
+
+
 def _require_plot_field(plot_spec: dict[str, Any], field_name: str) -> str:
     value = plot_spec.get(field_name)
     if not isinstance(value, str) or not value.strip():
@@ -302,7 +376,7 @@ def _field_values(rows: list[dict[str, Any]], field_name: str) -> list[Any]:
     values: list[Any] = []
     for row in rows:
         if field_name not in row:
-            raise ValueError(f"plot_data payload is missing required field: {field_name}")
+            raise ValueError(f"runtime source rows are missing required field: {field_name}")
         values.append(row[field_name])
     return values
 
@@ -346,7 +420,7 @@ def _series_groups(rows: list[dict[str, Any]], series_field: Any) -> list[tuple[
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if series_field not in row:
-            raise ValueError(f"plot_data payload is missing required field: {series_field}")
+            raise ValueError(f"runtime source rows are missing required field: {series_field}")
         grouped.setdefault(str(row[series_field]), []).append(row)
     return list(grouped.items())
 
@@ -587,6 +661,27 @@ def _rehydration_failure(round_id: str, query_id: str, reason: str) -> dict[str,
     }
 
 
+def _available_query_rows(
+    slug: str,
+    *,
+    session_id: str | None,
+    query_ref_key: tuple[str, str],
+    query_record: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str]:
+    if query_record.get("result_rows_persisted") is True and isinstance(query_record.get("result_rows"), list):
+        return [row for row in query_record["result_rows"] if isinstance(row, dict)], "persisted_result_rows"
+    round_id, query_id = query_ref_key
+    ephemeral_rows = get_ephemeral_result_rows(
+        slug,
+        session_id=session_id,
+        round_id=round_id,
+        query_id=query_id,
+    )
+    if isinstance(ephemeral_rows, list):
+        return [row for row in ephemeral_rows if isinstance(row, dict)], "ephemeral_result_rows"
+    return None, "unavailable"
+
+
 def _exception_reason(prefix: str, exc: Exception) -> str:
     message = str(exc).strip()
     if len(message) > 300:
@@ -603,6 +698,7 @@ def _rehydrate_missing_chart_result_rows(
     timeout: float,
     max_rows: int,
     max_cache_age_seconds: float | None,
+    temporary_visualization_rows_max: int | None,
 ) -> list[dict[str, Any]]:
     source_refs: list[tuple[str, str]] = []
     seen_refs: set[tuple[str, str]] = set()
@@ -766,7 +862,7 @@ def _rehydrate_missing_chart_result_rows(
                 runtime_request,
                 cached_rows,
                 warehouse_identity=warehouse_identity,
-                temporary_full_rows_max=max_rows,
+                temporary_full_rows_max=temporary_visualization_rows_max,
             )
             if not isinstance(retained_rows, list):
                 reason = retention_denial_reason or (
@@ -811,7 +907,7 @@ def _rehydrate_missing_chart_result_rows(
                 timeout=timeout,
                 max_rows=max_rows,
                 max_cache_age_seconds=max_cache_age_seconds,
-                temporary_full_rows_max=max_rows,
+                temporary_full_rows_max=temporary_visualization_rows_max,
             )
         except Exception as exc:
             results.append(
@@ -867,6 +963,7 @@ def render_chart_artifacts(
     client: Any | None = None,
     session_id: str | None = None,
     rehydrate_missing_result_rows: bool = False,
+    temporary_visualization_rows_max: int | None = None,
     timeout: float = 30.0,
     max_rows: int = 10_000,
     max_cache_age_seconds: float | None = None,
@@ -888,6 +985,7 @@ def render_chart_artifacts(
             timeout=timeout,
             max_rows=max_rows,
             max_cache_age_seconds=max_cache_age_seconds,
+            temporary_visualization_rows_max=temporary_visualization_rows_max,
         )
         if any(result.get("status") == "recovered" for result in rehydration_results):
             session_evidence = load_session_evidence(slug, session_id=session_id, strict_session=bool(session_id))
@@ -923,11 +1021,6 @@ def render_chart_artifacts(
             reason = "source query ref is not available in persisted session evidence"
         elif query_record.get("status") not in USABLE_QUERY_STATUSES:
             reason = "source query status is not eligible for chart rendering"
-        elif not query_record.get("result_rows_persisted") or not isinstance(query_record.get("result_rows"), list):
-            reason = "source query result rows were not retained for rendering"
-            rehydration_failure = rehydration_failures.get(query_ref_key)
-            if isinstance(rehydration_failure, dict) and rehydration_failure.get("reason"):
-                reason = f"{reason}; {rehydration_failure['reason']}"
         else:
             for evidence_ref in spec["evidence_refs"]:
                 if evidence_ref not in evidence_by_ref:
@@ -949,20 +1042,33 @@ def render_chart_artifacts(
             )
             continue
 
-        raw_rows = [row for row in query_record["result_rows"] if isinstance(row, dict)]
+        raw_rows, row_source = _available_query_rows(
+            slug,
+            session_id=session_id,
+            query_ref_key=query_ref_key,
+            query_record=query_record,
+        )
+        if raw_rows is None:
+            reason = "source query result rows were not available for rendering"
+            rehydration_failure = rehydration_failures.get(query_ref_key)
+            if isinstance(rehydration_failure, dict) and rehydration_failure.get("reason"):
+                reason = f"{reason}; {rehydration_failure['reason']}"
+            omitted_visuals.append({"spec_id": spec_id, "reason": reason})
+            summaries.append(
+                {
+                    "spec_id": spec_id,
+                    "semantic_chart_type": spec["semantic_chart_type"],
+                    "rendered": False,
+                    "notes": [reason],
+                }
+            )
+            continue
+
         source_result_hash = stable_payload_hash(raw_rows)
-        query_source_hashes_for_cleanup[query_ref_key] = source_result_hash
         try:
-            plot_data = {
-                "spec_id": spec["spec_id"],
-                "semantic_chart_type": spec["semantic_chart_type"],
-                "renderer_hint": spec.get("renderer_hint"),
-                "source_query_ref": dict(spec["source_query_ref"]),
-                "items": list(spec["plot_data"]["items"]),
-                "plot_spec": dict(spec["plot_spec"]),
-            }
-            _validate_plot_data_items(plot_data["items"], raw_rows)
-            png_bytes = _render_matplotlib_chart_png(spec)
+            plot_data, payload_warnings = _materialize_plot_data_from_source_rows(spec, raw_rows)
+            render_spec = {**spec, "plot_data": {"items": plot_data["items"]}}
+            png_bytes = _render_matplotlib_chart_png(render_spec)
             safe_spec_id = _safe_artifact_name_component(spec_id, fallback="chart")
             chart_id = f"{len(charts) + 1:02d}_{safe_spec_id}"
             plot_data_path = persist_artifact(
@@ -994,6 +1100,8 @@ def render_chart_artifacts(
             )
             continue
 
+        if row_source == "persisted_result_rows":
+            query_source_hashes_for_cleanup[query_ref_key] = source_result_hash
         charts.append(
             {
                 "chart_id": chart_id,
@@ -1017,9 +1125,19 @@ def render_chart_artifacts(
                 "spec_id": spec_id,
                 "semantic_chart_type": spec["semantic_chart_type"],
                 "rendered": True,
-                "notes": [f"Rendered from {source_query_ref['round_id']}:{source_query_ref['query_id']}."],
+                "notes": [
+                    f"Rendered from {source_query_ref['round_id']}:{source_query_ref['query_id']} using {row_source}."
+                ]
+                + payload_warnings,
             }
         )
+        if row_source == "ephemeral_result_rows":
+            clear_ephemeral_result_rows(
+                slug,
+                session_id=session_id,
+                round_id=query_ref_key[0],
+                query_id=query_ref_key[1],
+            )
 
     retention_cleanup = _purge_rendered_result_rows(
         slug,
@@ -1043,6 +1161,7 @@ def render_chart_artifacts(
         "omission_reasons": omission_reasons,
         "rehydration": {
             "attempted": bool(rehydrate_missing_result_rows),
+            "temporary_visualization_rows_max": temporary_visualization_rows_max,
             "results": rehydration_results,
             "recovered_count": sum(1 for result in rehydration_results if result.get("status") == "recovered"),
             "failed_count": sum(1 for result in rehydration_results if result.get("status") == "failed"),

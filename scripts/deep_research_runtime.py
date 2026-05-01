@@ -341,6 +341,7 @@ def cmd_render_charts(args: argparse.Namespace) -> None:
         session_mode=runtime.SESSION_MODE_ORCHESTRATED_ONLY,
         session_id=args.session_id,
         rehydrate_missing_result_rows=args.rehydrate_missing_result_rows,
+        temporary_visualization_rows_max=args.temporary_visualization_rows_max,
         timeout=args.timeout,
         max_rows=args.max_rows,
         max_cache_age_seconds=args.max_cache_age_seconds,
@@ -456,6 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_session_args(render_charts)
     render_charts.add_argument("--client-factory")
     render_charts.add_argument("--rehydrate-missing-result-rows", action="store_true")
+    render_charts.add_argument("--temporary-visualization-rows-max", type=_positive_int)
     render_charts.add_argument("--timeout", type=float, default=30.0)
     render_charts.add_argument("--max-rows", type=_positive_int, default=10_000)
     render_charts.add_argument("--max-cache-age-seconds", type=float)

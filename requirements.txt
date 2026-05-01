@@ -13,6 +13,4 @@
 # sqlalchemy>=2.0.0
 #
 # Plus one driver for your database:
-#   psycopg2-binary>=2.9     # PostgreSQL
-#   pymysql>=1.1             # MySQL / MariaDB
-#   sqlalchemy-bigquery>=1.9 # BigQuery
+#   <driver-package>         # install the driver for your warehouse dialect

@@ -1,0 +1,118 @@
+{
+  "eval_set_id": "example_retail_deep_research_v0",
+  "description": "Starter benchmark manifest for external agents executing the Deep Research Runtime deep-research skill family on real Example Retail warehouse data.",
+  "current_date": "2026-04-27",
+  "warehouse_client": "example_retail",
+  "default_domain_pack": "generic",
+  "gold_visibility": "private",
+  "scoring": {
+    "total_points": 100,
+    "dimensions": [
+      {
+        "id": "protocol_compliance",
+        "weight": 20
+      },
+      {
+        "id": "intent_and_scope_correctness",
+        "weight": 12
+      },
+      {
+        "id": "sql_and_evidence_quality",
+        "weight": 18
+      },
+      {
+        "id": "business_conclusion_accuracy",
+        "weight": 22
+      },
+      {
+        "id": "residual_and_uncertainty_discipline",
+        "weight": 10
+      },
+      {
+        "id": "lineage_and_artifact_integrity",
+        "weight": 10
+      },
+      {
+        "id": "report_and_visualization_usefulness",
+        "weight": 8
+      }
+    ]
+  },
+  "hard_failures": [
+    "stage_order_invalid",
+    "round_1_not_audit_first",
+    "unsupported_final_claim",
+    "missing_required_lineage",
+    "finalized_after_restart_required",
+    "destructive_or_non_readonly_sql"
+  ],
+  "cases": [
+    {
+      "case_id": "example_retail_audit_004",
+      "category": "intent_and_audit",
+      "difficulty": "easy",
+      "max_rounds": 2,
+      "user_prompt": "Q4 交易额 比 Q3 下降了吗？",
+      "success_standard": "Agent first validates the Q3 vs Q4 交易额 headline against gold before making any driver claim.",
+      "scoring_focus": [
+        "audit_first",
+        "metric_definition",
+        "headline_direction"
+      ]
+    },
+    {
+      "case_id": "example_retail_q3_q4_metric_driver_001",
+      "category": "metric_change_driver",
+      "difficulty": "medium",
+      "max_rounds": 3,
+      "user_prompt": "为什么 Example Retail 2025 Q4 交易额 比 Q3 下降？主要是谁驱动的？",
+      "success_standard": "Agent matches gold headline direction and magnitude band, identifies accepted primary negative driver, and separates demand, value, and structure evidence.",
+      "scoring_focus": [
+        "audit_first",
+        "decomposition_quality",
+        "primary_driver_match",
+        "honest_uncertainty"
+      ]
+    },
+    {
+      "case_id": "example_retail_machine_A-001_revenue_002",
+      "category": "metric_change_driver",
+      "difficulty": "medium",
+      "max_rounds": 3,
+      "user_prompt": "示例设备 A-001 最近 30 天收入下降，原因是什么？",
+      "success_standard": "Agent isolates machine A-001, compares recent 30 days with the previous 30 days, and identifies whether the drop is driven by demand, value, SKU mix, or supported fulfillment evidence.",
+      "scoring_focus": [
+        "business_object_resolution",
+        "time_window_correctness",
+        "machine_scope_filter",
+        "driver_layering"
+      ]
+    },
+    {
+      "case_id": "example_retail_false_decline_001",
+      "category": "contradiction_and_restart",
+      "difficulty": "medium",
+      "max_rounds": 2,
+      "user_prompt": "上周订单量大跌的原因是什么？",
+      "success_standard": "Gold shows no material drop; agent must reject or weaken the premise after audit and avoid unsupported driver claims.",
+      "scoring_focus": [
+        "premise_rejection",
+        "restart_or_stop_discipline",
+        "unsupported_claim_avoidance"
+      ]
+    },
+    {
+      "case_id": "example_retail_lineage_002",
+      "category": "runtime_and_governance",
+      "difficulty": "medium",
+      "max_rounds": 3,
+      "user_prompt": "给我一份带图的分析报告，说明最近 交易额 变化的主要原因。",
+      "success_standard": "Final claims have valid query or evaluation lineage; charts use explicit persisted evidence and do not introduce new unsupported conclusions.",
+      "scoring_focus": [
+        "final_answer_lineage",
+        "chart_spec_evidence_fidelity",
+        "compliance_report_cleanliness"
+      ]
+    }
+  ]
+}

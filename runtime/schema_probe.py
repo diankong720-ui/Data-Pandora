@@ -78,11 +78,14 @@ def probe_schema(
         tables:           Specific tables to probe; None = probe all visible.
         sample_limit:     Rows to fetch per table (default 3).
         list_tables_sql:  SQL to list visible tables. Dialect examples:
-                            MySQL / MariaDB : "SHOW TABLES"  (default)
-                            PostgreSQL      : "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-                            BigQuery        : "SELECT table_name FROM <dataset>.INFORMATION_SCHEMA.TABLES"
-                            Snowflake       : "SHOW TABLES"
-                            SQLite          : "SELECT name FROM sqlite_master WHERE type='table'"
+                            Simple catalog dialect:
+                                "SHOW TABLES"  (default)
+                            Information-schema dialect:
+                                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+                            Dataset information-schema dialect:
+                                "SELECT table_name FROM <dataset>.INFORMATION_SCHEMA.TABLES"
+                            Embedded catalog dialect:
+                                "SELECT name FROM sqlite_master WHERE type='table'"
     """
     snapshot: dict[str, Any] = {
         "warehouse_identity": client.identity,

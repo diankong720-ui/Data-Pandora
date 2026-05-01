@@ -1,356 +1,243 @@
-# Deep Research Skill Family
+# Deep Research Runtime
 
-This repository defines a contract-first, LLM-driven business research skill
-stack. It is designed for questions such as "why did this metric change?",
-"what drove this segment movement?", or "is this operational trend real?"
+Contract-first runtime for evidence-backed data analysis.
 
-The core idea is simple:
+Deep Research Runtime is a protocol layer for long-running analytical agents. It
+helps an LLM investigate questions such as "why did this metric move?", "which
+segment drove the change?", or "is this trend real?" without turning the
+runtime into a hidden decision-maker.
+
+The project splits responsibility cleanly:
 
 - The LLM owns business semantics, hypothesis design, SQL authorship,
-  evaluation reasoning, and final conclusions.
-- The runtime owns stage order, schema-safe handoffs, SQL execution, cache
-  policy, artifact persistence, lineage validation, and compliance reporting.
-- The runtime never compiles semantic placeholders into SQL and never invents
-  business meaning that the LLM did not explicitly author.
+  evaluation reasoning, chart intent, and final conclusions.
+- The runtime owns stage order, contract validation, SQL execution, row
+  retention policy, artifact persistence, lineage checks, restart handling,
+  chart materialization, and compliance output.
+- Host systems own warehouse credentials, client adapters, live-mode approval,
+  retention policy, report policy, and the optional LLM callback wiring.
 
-The user-facing entrypoint is
-[`deep-research`](skills/deep-research/SKILL.md). The other skill documents are
-internal stage protocols used by that orchestrator.
+The result is a deep research loop that can continue, pivot, stop, or restart
+based on evidence, while keeping every claim and chart traceable to persisted
+runtime artifacts.
 
 ---
 
-## Core Methodology
+## Why This Exists
 
-The methodology is defined in
-[`core-methodology.md`](skills/deep-research/references/core-methodology.md) and
-is domain-agnostic. Domain packs can tune vocabulary and priors, but they do not
-replace the method.
+Most data agents fail in one of two ways:
 
-### Guiding Principles
+1. They let the LLM freely improvise SQL, conclusions, and charts without a
+   durable audit trail.
+2. They hard-code too much analytical behavior, forcing the LLM to adapt its
+   reasoning to runtime rules that should have been advisory or host policy.
 
-- Baseline before claims: verify that the headline issue and analytical frame
-  are valid before promoting driver explanations.
-- Bounded investigation: every executable round is governed by an explicit
-  `InvestigationContract`.
-- Traceable evidence: every supported final claim must trace to concrete query
-  results or explicit evaluation lineage.
-- Graceful degradation: when schema, load, or runtime constraints block decisive
-  tests, return an honest partial answer instead of widening the scan.
-- Honest uncertainty: contradictions, residual uncertainty, and unresolved rival
-  hypotheses stay visible.
+This project chooses a third path: **the runtime is strict about protocol and
+evidence, but intentionally neutral about business judgment**.
 
-### Five Analysis Layers
+```mermaid
+flowchart LR
+    User["User asks an analytical question"]
+    LLM["LLM: semantics, hypotheses, SQL, evaluation, narrative"]
+    Runtime["Runtime: protocol, execution, lineage, policy, artifacts"]
+    Warehouse["Warehouse client: read-only query execution"]
+    Report["Evidence-backed report and charts"]
 
-The research method uses five layers. A session does not have to exhaust every
-layer, but it must respect their order of responsibility.
+    User --> LLM
+    LLM -->|"explicit artifacts and contracts"| Runtime
+    Runtime -->|"validated SQL only"| Warehouse
+    Warehouse -->|"query rows and metadata"| Runtime
+    Runtime -->|"persisted evidence"| LLM
+    Runtime --> Report
+```
 
-| Layer | Purpose | Typical evidence |
+---
+
+## Design Philosophy
+
+Deep research is not "run more SQL until the answer sounds confident." It is a
+closed-loop investigation discipline.
+
+| Principle | Runtime interpretation | LLM freedom preserved |
 | --- | --- | --- |
-| Audit | Check whether the observed issue and analytical frame are real. | Metric existence, scope validity, time-field validity, definition conflicts. |
-| Demand | Check whether activity volume changed. | Transaction count, active entity count, buyer or user count. |
-| Value | Check whether value per activity changed. | Average order value, unit value, frequency, rate changes. |
-| Structure | Check whether composition changed across supported dimensions. | Channel, product, region, seller, segment, concentration shifts. |
-| Fulfillment | Check whether operational or supply-side factors explain movement. | Availability, completion, fulfillment, cancellation, supply constraints. |
-
-Round 1 is audit-first. Later rounds may move into demand, value, structure, or
-fulfillment only when the latest evaluation authorizes a sharper next test.
-
-### Residual Logic
-
-The loop is driven by residual uncertainty, not by a desire to "use all rounds".
-
-Residual has two parts:
-
-- Arithmetic residual: how much of the headline movement remains unattributed.
-- Epistemic residual: how much uncertainty remains because evidence is weak,
-  contradictory, blocked, or not yet tested.
-
-After every round, the evaluator rebuilds residual state, updates hypothesis
-states, and chooses `refine`, `pivot`, `stop`, or `restart`. A new round is legal
-only when the evaluator can name a high-value unresolved question and a clearer
-next test.
+| Baseline before claims | Round 1 must validate the analytical frame before driver claims are promoted. | The LLM still chooses how to test the baseline. |
+| Bounded investigation | Every executable round must be an explicit `InvestigationContract`. | The LLM authors the contract and SQL. |
+| Residual-driven continuation | More rounds require a named unresolved question and a better next test. | The LLM decides whether to refine, pivot, stop, or restart. |
+| Evidence lineage | Final claims and charts must point to persisted query lineage. | The LLM decides what the claim means and how to explain it. |
+| Graceful degradation | Missing rows, blocked load, or unsupported charts degrade locally. | The report can still finish with honest uncertainty. |
+| Host policy over hard-coded policy | Retention, locale, live access, and sensitive-data handling stay configurable. | The LLM does not have to satisfy arbitrary hidden runtime preferences. |
 
 ---
 
-## Full Execution Flow
+## System Architecture
 
-The protocol is serial. Stages must not be skipped, reordered, or merged into a
-freeform answer.
+```mermaid
+flowchart TB
+    subgraph Skill["Skill Protocol Documents"]
+        Entry["skills/deep-research/SKILL.md"]
+        Contracts["references/contracts.md"]
+        Method["references/core-methodology.md"]
+        StageDocs["intent / discovery / planning / evaluation / visualization docs"]
+    end
 
-```text
-User question + current_date
-  |
-  v
-1. intent
-   -> intent.json + intent_sidecar.json
-  |
-  v
-2. discovery
-   -> environment_scan.json
-  |
-  v
-3. planning
-   -> plan.json + round_1_contract
-  |
-  v
-4. execution
-   -> round bundle with contract + executed_queries
-  |
-  v
-5. evaluation
-   -> round evaluation + next-step decision
-  |
-  +-- refine / pivot --> next InvestigationContract --> Stage 4
-  |
-  +-- restart -------> return to Stage 1 with a new intent frame
-  |
-  +-- stop ----------> Stage 6
-  |
-  v
-6. finalization
-   -> final_answer.json + report_evidence.json + report_evidence_index.json
-  |
-  v
-7a. chart_spec
-   -> chart_spec_bundle.json
-  |
-  v
-7b. chart_render
-   -> descriptive_stats.json + visualization_manifest.json + charts/*
-  |
-  v
-7c. report_assembly
-   -> report.md + compliance_report.json
-  |
-  v
-8. suggestion_synthesis
-   -> domain_pack_suggestions.json when applicable
+    subgraph Runtime["Python Runtime"]
+        State["session_state.py\nstage gates and freeze checks"]
+        ContractsPy["contracts.py\nschema validation"]
+        Tools["tools.py\nSQL execution and retention"]
+        Orchestration["session_orchestration.py\nend-to-end stage persistence"]
+        Viz["visualization.py\nruntime chart materialization"]
+        Compliance["compliance.py\ntrace, evidence graph, audit"]
+    end
+
+    subgraph Host["Host Integration"]
+        Callbacks["produce_* callbacks\nLLM or replay adapter"]
+        Client["WarehouseClient alias"]
+        Policy["runtime/report/retention policy"]
+    end
+
+    subgraph Output["Session Artifacts"]
+        Round["round bundles"]
+        Evidence["report evidence and index"]
+        Charts["visualization manifest and charts"]
+        Report["report.md and compliance_report.json"]
+    end
+
+    Entry --> Contracts
+    Entry --> Method
+    Entry --> StageDocs
+    Contracts --> ContractsPy
+    Host --> Orchestration
+    Orchestration --> State
+    Orchestration --> ContractsPy
+    Orchestration --> Tools
+    Orchestration --> Viz
+    Orchestration --> Compliance
+    Tools --> Round
+    Compliance --> Evidence
+    Viz --> Charts
+    Evidence --> Report
+    Charts --> Report
 ```
 
-Conceptually, Stage 7 is "data visualization". In the runtime it is split into
-`chart_spec`, `chart_render`, and `report_assembly` so chart semantics,
-rendering, and final report packaging remain auditable.
+Primary runtime surfaces:
 
-The runtime stage sequence is implemented in
-[`runtime/session_state.py`](runtime/session_state.py), and the end-to-end
-orchestrated flow is implemented by
-[`run_research_session`](runtime/session_orchestration.py).
-
----
-
-## Stage Responsibilities And Collaboration
-
-Each stage owns one kind of decision. Downstream stages consume frozen upstream
-artifacts instead of rewriting them.
-
-| Stage | Role | Consumes | Produces | Hands off to |
-| --- | --- | --- | --- | --- |
-| 1. Intent Recognition | Normalize the user question into a safe research frame. | `raw_question`, `current_date`, domain pack options. | `IntentRecognitionResult`, frozen `NormalizedIntent`, `pack_gaps`. | Discovery receives a semantic intent with no physical schema leakage. |
-| 2. Environment Discovery | Inspect available warehouse facts and map schema capabilities. | Frozen intent, runtime probes, legal domain-pack hints. | `DataContextBundle`. | Planning receives metric, time, dimension, joinability, and feasibility context. |
-| 3. Planning | Define the candidate explanation space and author executable Round 1. | Frozen intent, discovery bundle, domain pack priors. | `PlanBundle`, `HypothesisBoardItem[]`, `round_1_contract`. | Execution receives a full `InvestigationContract`; evaluation receives the hypothesis board as context. |
-| 4. Execution | Run exactly the explicit contract queries and persist evidence. | Current `InvestigationContract`, runtime client, cache/admission policy. | `QueryExecutionResult[]`, execution log, round bundle. | Evaluation receives actual query outcomes and runtime metadata. |
-| 5. Evaluation | Interpret the round, update residual state, and authorize the next move. | Contract, executed queries, prior evaluation, plan context. | `RoundEvaluationResult`, continuation token when continuing. | Next-contract producer receives structured guidance, or finalization receives a stop state. |
-| 6. Finalization | Synthesize the evidence-backed answer and report evidence bundle. | Latest evaluation and full session evidence. | `FinalAnswer`, `ReportEvidenceBundle`, `ReportEvidenceIndex`. | Chart spec consumes only supported, indexed evidence. |
-| 7a. Chart Spec | Author structured chart specifications from persisted evidence. | Final answer, report evidence, session evidence, renderer capabilities. | `chart_spec_bundle.json`. | Chart render receives explicit plot data and high-level `plot_spec` instructions. |
-| 7b. Chart Render | Render charts without inventing chart semantics. | Chart specs, persisted evidence, renderer capabilities. | `descriptive_stats.json`, `visualization_manifest.json`, chart files, plot-data snapshots. | Report assembly receives auditable visuals and stats. |
-| 7c. Report Assembly | Package the human-readable report. | Final answer, report evidence, chart artifacts, manifest locale/template. | `report.md`, refreshed compliance report. | Suggestion synthesis runs only after report completion. |
-| 8. Suggestion Synthesis | Propose domain-pack improvements after the session. | `pack_gaps`, active pack id, completed session context. | `domain_pack_suggestions.json` when useful. | No downstream stage; this is best-effort and non-blocking. |
-
-Important collaboration rules:
-
-- Stage 1 cannot choose tables, fields, joins, or SQL.
-- Stage 2 can map schema capabilities but cannot verify the headline movement or
-  conclude causes.
-- Stage 3 can plan Round 1 but cannot pre-script Round 2+.
-- Stage 4 cannot rewrite SQL, add queries, or repair an incomplete contract.
-- Stage 5 cannot invent execution evidence; it can only evaluate persisted
-  results and authorize the next action.
-- Stage 6 cannot introduce unsupported claims or hide contradictions.
-- Stage 7 cannot create new analysis, new SQL, or new conclusions.
-- Stage 8 cannot block or rewrite the completed answer.
-
----
-
-## Deep Research Loop Design
-
-The deep research loop is the critical mechanism in this version of the skill.
-It prevents the system from turning a hypothesis board into a fixed script while
-still allowing multi-round investigation.
-
-### 1. Round 1 Is Seeded By The Plan
-
-`PlanBundle` defines the candidate hypothesis space and includes only one
-directly executable contract: `round_1_contract`.
-
-Round 1 must be audit-first. If the user asks about a metric movement, Round 1
-must validate the headline metric and frame before later driver claims are
-promoted.
-
-### 2. Execution Is Contract-Locked
-
-Execution accepts an `InvestigationContract` and runs only its
-`queries[]`. The runtime may enforce SQL safety, cache policy, row limits, and
-warehouse admission, but it does not rewrite SQL or infer missing semantics.
-
-This keeps the LLM accountable for every executed query and keeps runtime
-behavior auditable.
-
-### 3. Evaluation Is The Control Point
-
-After each round, `investigation-evaluator` produces a
-`RoundEvaluationResult`.
-
-The evaluation must:
-
-- update each hypothesis state as `proposed`, `supported`, `weakened`,
-  `rejected`, `not_tested`, or `blocked_by_load`
-- rebuild residual state and explain whether uncertainty went down, stayed
-  flat, or got worse
-- identify unresolved open questions
-- recommend exactly one next action: `refine`, `pivot`, `stop`, or `restart`
-- emit `continuation_guidance` whenever `should_continue = true`
-
-Remaining `max_rounds` is only a safety ceiling. It is never a reason to
-continue by itself.
-
-### 4. Continuation Requires Authorization
-
-Round 2+ is not derived by expanding the original plan. It is derived from the
-latest evaluation.
-
-When evaluation authorizes `refine` or `pivot`, the runtime records a
-continuation token. The next-contract producer must use that token and the
-latest `continuation_guidance` as the controlling input.
-
-The next contract must:
-
-- target the authorized residual component
-- bind queries to prioritized open question ids
-- materially change the parent round through a sharper target, a different
-  operator, or different SQL
-- preserve lineage back to the parent evaluation
-
-If continuation lacks structured guidance, the session stops at evaluation
-instead of improvising the next round.
-
-### 5. Stop And Restart Are Different
-
-`stop` means the current intent frame remains valid and the best available
-answer can be finalized, possibly as a partial answer.
-
-`restart` means audit evidence invalidated the frozen intent frame itself. In
-that case, `final_answer.json` is illegal until the session returns to Stage 1
-and rebuilds intent, discovery, and planning under a new frame.
-
-### 6. Finalization Freezes Claims
-
-Finalization can summarize only what the loop has already supported. It creates
-the answer and report evidence, then visualization/report stages package that
-evidence for humans. No post-finalization stage may add new analytical claims.
-
----
-
-## Runtime And Contract Surface
-
-All shared object definitions live in
-[`contracts.md`](skills/deep-research/references/contracts.md). If a stage doc
-conflicts with `contracts.md`, the contract file wins.
-
-Primary runtime entrypoints:
-
-- [`runtime/tools.py`](runtime/tools.py): `execute_query_request()` and legacy
-  `execute_sql()`.
-- [`runtime/orchestration.py`](runtime/orchestration.py):
-  `execute_investigation_contract()`, `execute_round_and_persist()`, and
-  `finalize_session()`.
+- [`scripts/deep_research_runtime.py`](scripts/deep_research_runtime.py):
+  bridge CLI for local agents and scripted stage handoff.
 - [`runtime/session_orchestration.py`](runtime/session_orchestration.py):
-  `run_research_session()` and stage persistence gates.
-- [`runtime/evaluation.py`](runtime/evaluation.py): round evaluation validation
-  and persistence.
-- [`runtime/final_answer.py`](runtime/final_answer.py): final answer validation
-  and persistence.
-- [`runtime/visualization.py`](runtime/visualization.py): chart rendering and
-  report assembly from persisted evidence.
-- [`runtime/domain_pack_suggestions.py`](runtime/domain_pack_suggestions.py):
-  post-session domain-pack suggestion validation and persistence.
-
-Local agents should bind the runtime through
-[`scripts/deep_research_runtime.py`](scripts/deep_research_runtime.py) instead
-of assuming sibling `runtime/` modules are importable from a skill working
-directory:
-
-```bash
-python3 scripts/deep_research_runtime.py doctor
-```
-
-When the current directory is `skills/deep-research/`, use:
-
-```bash
-python3 ../../scripts/deep_research_runtime.py doctor
-```
-
-The bridge adds the repository root to `sys.path` and exposes
-`start-session`, `capabilities`, `persist-*`, `probe-schema`,
-`execute-contract`, `render-charts`, `assemble-report`, and
-`persist-suggestions` commands. `start-session` also accepts
-`--runtime-policy`, `--report-policy`, and `--semantic-guard-policy` JSON files.
-`probe-schema` and `execute-contract` accept
-registered client factory aliases only; hosts register custom aliases through
-`DEEP_RESEARCH_CLIENT_FACTORIES`.
-`run_research_session(...)` remains a host integration API; it requires external
-`produce_*` callbacks and is not a standalone LLM runner.
-
-Runtime guarantees:
-
-- validates stage order and prerequisite artifacts
-- freezes upstream artifacts such as `intent.json`
-- executes only explicit LLM-authored SQL
-- enforces `cache_policy = bypass | allow_read | require_read`
-- records execution metadata in `execution_log.json`
-- persists round bundles as `{ contract, executed_queries, evaluation }`
-- validates continuation lineage for Round 2+
-- blocks finalization after `restart_required`
-- builds `protocol_trace.json`, `evidence_graph.json`, and
-  `compliance_report.json`
-
-Runtime does not:
-
-- choose tables, joins, filters, metrics, hypotheses, or next actions
-- compile semantic query plans into SQL
-- generate evaluator reasoning or final claims
-- infer chart types, field roles, or transform semantics for visualization
-- hard-code report language; hosts may provide `report_locale`,
-  `report_template`, or `runtime_policy.report_policy`
+  `run_research_session(...)` host integration API.
+- [`runtime/tools.py`](runtime/tools.py): query execution, row previews, row
+  retention, redaction, and ephemeral row registration.
+- [`runtime/visualization.py`](runtime/visualization.py): chart data
+  materialization, chart rendering, and report assembly.
+- [`scripts/run_project_eval.py`](scripts/run_project_eval.py): project-level
+  eval harness for protocol, flow completion, security, stability, and quality.
 
 ---
 
-## Domain Packs
+## Deep Research Flow
 
-Domain packs are the only context-specific configuration layer. They help the
-LLM map business vocabulary and choose better priors, but they do not override
-the shared contracts or the five-layer methodology.
+The protocol is serial. Stages cannot be skipped, merged, or silently rewritten.
 
-They can tune:
+```mermaid
+flowchart TD
+    Q["Question + current_date"]
+    I["1. Intent\nintent.json + intent_sidecar.json"]
+    D["2. Discovery\nenvironment_scan.json"]
+    P["3. Planning\nplan.json + round_1_contract"]
+    X["4. Execution\nround bundle + executed queries"]
+    E["5. Evaluation\nresidual state + next action"]
+    F["6. Finalization\nfinal_answer + report evidence"]
+    CS["7a. Chart Spec\nchart_spec_bundle.json"]
+    CR["7b. Chart Render\ndescriptive_stats + visualization_manifest"]
+    R["7c. Report Assembly\nreport.md + compliance_report"]
+    S["8. Suggestions\ndomain_pack_suggestions.json"]
 
-- metric, dimension, and business-object vocabulary
-- unsupported-dimension hints
-- problem-type scoring hints
-- hypothesis-family priors
-- operator preferences
-- performance-risk hints
+    Q --> I --> D --> P --> X --> E
+    E -->|"refine / pivot"| X
+    E -->|"restart"| I
+    E -->|"stop"| F
+    F --> CS --> CR --> R --> S
+```
 
-They cannot provide physical schema shortcuts to Stage 1, replace discovery, or
-remove the requirement that executable SQL is authored explicitly by the LLM.
+### The Investigation Loop
 
-See
-[`DOMAIN_PACK_GUIDE.md`](skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md)
-for the pack schema and consumer matrix.
+The loop is driven by residual uncertainty, not by a desire to consume all
+available rounds.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Audit
+    Audit --> Evaluate: execute round
+    Evaluate --> Refine: progress + residual remains
+    Evaluate --> Pivot: current path weakens
+    Evaluate --> Stop: enough evidence or no better test
+    Evaluate --> Restart: intent frame invalidated
+    Refine --> Evaluate: sharper next contract
+    Pivot --> Evaluate: different hypothesis path
+    Restart --> Audit: new generation
+    Stop --> Finalize
+    Finalize --> Visualize
+    Visualize --> [*]
+```
+
+Hypothesis states are explicit: `proposed`, `supported`, `weakened`,
+`rejected`, `not_tested`, and `blocked_by_load`. A `not_tested` hypothesis is
+evidence state, not a hard runtime ban; it may be targeted again when the latest
+evaluation authorizes a better evidence path. `rejected` remains excluded by
+default unless a future explicit reopen flow is designed.
 
 ---
 
-## Artifact Layout
+## Signature Mechanisms
 
-Each session writes explicit artifacts under `RESEARCH/<slug>/sessions/<session_id>/`.
+| Mechanism | What it prevents | How it works |
+| --- | --- | --- |
+| Stage freeze with idempotent replay | Downstream artifacts consuming a moving upstream target. | Completed stages may replay the same payload; different payloads against frozen artifacts are blocked. |
+| Contract-locked execution | Runtime inventing or "repairing" SQL. | Execution runs only `InvestigationContract.queries[]` after validation and admission checks. |
+| Continuation token | Round 2+ becoming a pre-scripted plan expansion. | New rounds must cite the latest evaluation, parent round, open question, intent hash, and plan hash. |
+| Restart generation tracking | Invalidated intent frames producing final answers. | Restart records cause history, switches generation, and blocks finalization until a new frame is built. |
+| Unified row retention | Preview leaking fields that result rows removed. | `rows_preview` and `result_rows` use the same retention and redaction policy. |
+| Ephemeral chart rows | Chart success depending on persisted full rows. | Same-process runs may render charts from temporary rows without writing full rows to artifacts. |
+| Runtime chart materialization | LLM-invented chart values. | LLM supplies chart semantics and field mapping; runtime pulls values from real query rows. |
+| Local chart degradation | One chart failure breaking a long report. | Missing or unsafe chart data omits that chart and records a warning; report assembly continues. |
+| Open business object taxonomy | Narrow enums forcing wrong business semantics. | Common entity types are accepted, and unknown objects can use `other` with the original label. |
+| Project eval harness | Fixes that pass unit checks but reduce completion quality. | Mock/replay and optional live suites score completion, stability, security, lineage, and report quality. |
+
+---
+
+## Chart Truth Model
+
+Charts are intentionally split into LLM-authored semantics and runtime-owned
+data materialization.
+
+```mermaid
+sequenceDiagram
+    participant LLM
+    participant Runtime
+    participant Rows as Retained/Ephemeral/Rehydrated Rows
+    participant Chart as Chart Artifact
+
+    LLM->>Runtime: ChartSpec(type, source_query_ref, plot_spec, row selection)
+    Runtime->>Rows: Load source rows allowed by policy
+    Rows-->>Runtime: Real query rows or unavailable
+    alt rows available and fields allowed
+        Runtime->>Runtime: Build plot data from source rows
+        Runtime->>Chart: Render chart + plot-data snapshot
+    else rows unavailable or redacted field missing
+        Runtime->>Chart: Omit chart with warning
+    end
+```
+
+The LLM may include `plot_data.payload` for compatibility, but numeric payload
+values do not drive rendering. If payload values disagree with runtime rows, the
+runtime records a warning and renders from source rows when possible.
+
+---
+
+## Artifact Map
+
+Each session writes explicit artifacts under
+`RESEARCH/<slug>/sessions/<session_id>/`.
 
 ```text
 RESEARCH/<slug>/
@@ -363,9 +250,7 @@ RESEARCH/<slug>/
       intent_sidecar.json
       environment_scan.json
       plan.json
-      rounds/
-        <generation_id>/
-          <round_id>.json
+      rounds/<generation_id>/<round_id>.json
       execution_log.json
       final_answer.json
       report_evidence.json
@@ -382,42 +267,229 @@ RESEARCH/<slug>/
       domain_pack_suggestions.json
 ```
 
-Artifact semantics:
+The key invariant is simple: **final answers, charts, and reports are packaging
+layers over persisted evidence, not places to create new analysis.**
 
-- `intent.json` stores the frozen `NormalizedIntent`.
-- `intent_sidecar.json` stores `pack_gaps`.
-- `environment_scan.json` stores the `DataContextBundle`.
-- `plan.json` stores the `PlanBundle`.
-- `rounds/<generation_id>/<round_id>.json` stores the round contract, executed
-  query results, and evaluation.
-- `final_answer.json` stores the supported answer.
-- `report_evidence.json` and `report_evidence_index.json` store claim lineage
-  for report and visualization stages.
-- `visualization_manifest.json` stores chart lineage and render outcomes.
-- `domain_pack_suggestions.json` is optional and best-effort.
+---
 
-For consumers that need the complete context, use `load_session_evidence(slug)`.
+## Competitive Comparison
+
+The table below compares product shapes, not named vendors. Scores are
+architecture-capability rubric scores produced from this repository's design
+criteria. They are not public market benchmarks; use
+`scripts/run_project_eval.py` to re-score concrete implementations.
+
+Scoring scale:
+
+- 0 = absent
+- 1 = weak/manual
+- 3 = partial
+- 5 = first-class mechanism
+
+| Capability | SQL Chatbot | Notebook Agent | BI Copilot | Workflow Agent | Deep Research Runtime |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Explicit stage protocol | 1 | 2 | 2 | 3 | 5 |
+| Frozen artifact discipline | 0 | 1 | 1 | 3 | 5 |
+| Contract-locked SQL execution | 1 | 2 | 2 | 3 | 5 |
+| Multi-round residual logic | 1 | 2 | 1 | 3 | 5 |
+| Restart vs stop distinction | 0 | 1 | 1 | 2 | 5 |
+| Claim-to-query lineage | 1 | 2 | 3 | 3 | 5 |
+| Chart data truth enforcement | 0 | 1 | 2 | 2 | 5 |
+| Row retention and redaction policy | 1 | 1 | 3 | 3 | 5 |
+| Local degradation without flow breakage | 1 | 2 | 2 | 3 | 5 |
+| Project-level eval harness | 0 | 1 | 1 | 2 | 5 |
+| **Total capability score / 100** | **12** | **30** | **36** | **54** | **100** |
+
+```mermaid
+xychart-beta
+    title "Architecture Capability Score"
+    x-axis ["SQL Chatbot", "Notebook Agent", "BI Copilot", "Workflow Agent", "Deep Research Runtime"]
+    y-axis "Score / 100" 0 --> 100
+    bar [12, 30, 36, 54, 100]
+```
+
+### What The Score Means
+
+| Project shape | Strong at | Typical gap |
+| --- | --- | --- |
+| SQL Chatbot | Fast single-query exploration. | Weak closure, weak lineage, charts can become narrative decoration. |
+| Notebook Agent | Flexible analysis and inspectable code cells. | State is often notebook-local rather than protocol-governed. |
+| BI Copilot | Dashboard-native summaries and metric lookup. | Often optimized for known semantic layers, less for uncertain investigation. |
+| Workflow Agent | Tool sequencing and task automation. | May coordinate steps without enforcing analytical evidence discipline. |
+| Deep Research Runtime | Evidence-backed multi-round investigation with audit artifacts. | Requires explicit callbacks, contracts, policies, and host integration. |
+
+---
+
+## Evaluation Model
+
+The project-level eval harness is designed to test more than isolated bugs. It
+checks whether a complete research task can finish safely and produce useful
+artifacts.
+
+```mermaid
+flowchart LR
+    Case["Case manifest"]
+    Adapter["Agent adapter\nartifact replay or callback"]
+    Runtime["Runtime session"]
+    Artifacts["Artifacts"]
+    Scorers["Completeness\nSecurity\nQuality\nStability"]
+    Summary["eval_summary.json"]
+
+    Case --> Adapter --> Runtime --> Artifacts --> Scorers --> Summary
+```
+
+Default scoring weights:
+
+| Dimension | Weight |
+| --- | ---: |
+| Protocol compliance | 20 |
+| Intent and scope correctness | 12 |
+| SQL and evidence quality | 18 |
+| Business conclusion accuracy | 22 |
+| Residual and uncertainty discipline | 10 |
+| Lineage and artifact integrity | 10 |
+| Report and visualization usefulness | 8 |
+
+Run the deterministic mock suite:
+
+```bash
+python3 scripts/run_project_eval.py --suite mock --agent artifact_replay
+```
+
+Optional live suites are off by default and require explicit flags plus
+environment variables. Credentials must be injected through the environment, not
+committed to the repository or written into artifacts.
+
+```bash
+python3 scripts/run_project_eval.py \
+  --suite example_retail \
+  --live-example-retail \
+  --agent callback \
+  --case example_retail_audit_004
+```
+
+---
+
+## Quick Start
+
+Verify runtime wiring:
+
+```bash
+python3 scripts/deep_research_runtime.py doctor
+```
+
+Inspect runtime capabilities:
+
+```bash
+python3 scripts/deep_research_runtime.py capabilities
+```
+
+Create a session root:
+
+```bash
+python3 scripts/deep_research_runtime.py start-session \
+  --slug demo-analysis \
+  --question "Why did the example metric change this month?" \
+  --current-date 2026-05-01
+```
+
+Run compile and smoke checks:
+
+```bash
+python3 -m py_compile runtime/*.py runtime/example_clients/*.py \
+  scripts/deep_research_runtime.py scripts/run_project_eval.py
+python3 scripts/run_project_eval.py --suite mock --agent artifact_replay
+```
+
+`run_research_session(...)` is the host integration API. It requires external
+`produce_*` callbacks; this repository does not bundle a standalone LLM runner.
+
+---
+
+## Host Integration
+
+Implement a `WarehouseClient` and register it through a factory alias. The
+runtime accepts aliases, not LLM-authored filesystem paths.
+
+```bash
+export DEEP_RESEARCH_CLIENT_FACTORIES='{"warehouse":"package.module:create_client"}'
+```
+
+Example signed HTTP client configuration:
+
+```bash
+export VENDOR_WAREHOUSE_BASE_URL="https://<warehouse-host>"
+export VENDOR_WAREHOUSE_PATH="/<sql-endpoint>"
+export VENDOR_WAREHOUSE_CHANNEL="<channel-or-app-id>"
+export VENDOR_WAREHOUSE_SECRET="<request-signing-secret>"
+```
+
+Probe schema through the bridge:
+
+```bash
+python3 scripts/deep_research_runtime.py probe-schema \
+  --client-factory warehouse \
+  --list-tables-sql "SHOW TABLES"
+```
+
+---
+
+## Security And Governance
+
+Security is project-level behavior, not an afterthought bolted onto final
+reports.
+
+| Area | Runtime behavior |
+| --- | --- |
+| SQL execution | Executes only explicit contract queries after safety and admission checks. |
+| Destructive SQL | Treated as a hard failure by eval security scanning. |
+| Credentials | Passed through host environment; scanned for leaks in eval artifacts. |
+| Row retention | Defaults to preview-only unless host policy grants retention. |
+| Redaction | Preview and result rows share the same retention and redaction path. |
+| Charts | Can only render from retained, ephemeral, or explicitly rehydrated runtime rows. |
+| Restart | Blocks finalization until a new valid intent generation is created. |
+| Frozen artifacts | Same-payload replay is allowed; mutation is blocked. |
+
+---
+
+## Domain Packs
+
+Domain packs are the context customization layer. They can tune vocabulary,
+problem-type priors, unsupported-dimension hints, operator preferences, and
+performance-risk hints.
+
+They cannot:
+
+- replace discovery
+- provide physical schema shortcuts to Stage 1
+- weaken SQL safety
+- bypass evidence lineage
+- force the LLM into inaccurate business-object categories
+
+See
+[`skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md`](skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md)
+for the pack schema and consumer matrix.
 
 ---
 
 ## Canonical Documents
 
 - [`skills/deep-research/SKILL.md`](skills/deep-research/SKILL.md): official
-  user-facing protocol.
-- [`contracts.md`](skills/deep-research/references/contracts.md): shared object
-  source of truth.
-- [`core-methodology.md`](skills/deep-research/references/core-methodology.md):
-  residual logic, round policy, and conclusion-state discipline.
-- [`intent-recognition/SKILL.md`](skills/intent-recognition/SKILL.md): Stage 1
-  intent normalization.
-- [`data-discovery/SKILL.md`](skills/data-discovery/SKILL.md): Stage 2
+  user-facing protocol entrypoint.
+- [`skills/deep-research/references/contracts.md`](skills/deep-research/references/contracts.md):
+  shared object source of truth.
+- [`skills/deep-research/references/core-methodology.md`](skills/deep-research/references/core-methodology.md):
+  residual logic, round policy, and conclusion discipline.
+- [`skills/intent-recognition/SKILL.md`](skills/intent-recognition/SKILL.md):
+  Stage 1 intent normalization.
+- [`skills/data-discovery/SKILL.md`](skills/data-discovery/SKILL.md): Stage 2
   environment discovery.
-- [`hypothesis-engine.md`](skills/deep-research/sub-skills/hypothesis-engine.md):
+- [`skills/deep-research/sub-skills/hypothesis-engine.md`](skills/deep-research/sub-skills/hypothesis-engine.md):
   Stage 3 planning.
-- [`investigation-evaluator.md`](skills/deep-research/sub-skills/investigation-evaluator.md):
+- [`skills/deep-research/sub-skills/investigation-evaluator.md`](skills/deep-research/sub-skills/investigation-evaluator.md):
   Stage 5 evaluation.
-- [`data-visualization/SKILL.md`](skills/data-visualization/SKILL.md): Stage 7
-  reporting and visualization.
+- [`skills/data-visualization/SKILL.md`](skills/data-visualization/SKILL.md):
+  Stage 7 visualization and reporting.
 
 ---
 
@@ -425,11 +497,12 @@ For consumers that need the complete context, use `load_session_evidence(slug)`.
 
 1. Use `deep-research` as the full-session entrypoint.
 2. Treat `contracts.md` as the source of truth for shared object shapes.
-3. Freeze `NormalizedIntent` once Stage 2 begins.
-4. Keep Stage 2 discovery-only.
+3. Freeze upstream artifacts once downstream stages consume them.
+4. Keep discovery separate from claims.
 5. Make Round 1 audit-first.
 6. Execute only explicit `InvestigationContract.queries[]`.
 7. Continue only when the latest evaluation identifies a better next test.
 8. Preserve contradictions and residual uncertainty.
 9. Trace every supported final claim to persisted evidence.
-10. Do not use visualization or report assembly to introduce new claims.
+10. Use visualization and report assembly only to package evidence, not to add
+    new analysis.

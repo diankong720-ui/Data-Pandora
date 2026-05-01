@@ -20,11 +20,16 @@ FINAL_ANSWER_REQUIRED_FIELDS = (
 )
 
 
-def get_latest_round_evaluation(slug: str, *, session_id: str | None = None) -> dict[str, Any] | None:
+def get_latest_round_evaluation(
+    slug: str,
+    *,
+    session_id: str | None = None,
+    generation_id: str | None = None,
+) -> dict[str, Any] | None:
     """Return the latest persisted RoundEvaluationResult based on round_number."""
     latest: dict[str, Any] | None = None
     latest_round_number = -1
-    active_generation_id = get_active_generation_id(
+    active_generation_id = generation_id or get_active_generation_id(
         slug,
         session_id=session_id,
         strict_session=bool(session_id),

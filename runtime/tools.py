@@ -24,6 +24,7 @@ import hashlib
 from typing import Any
 
 from runtime.contracts import validate_query_execution_request
+from runtime.ephemeral_rows import register_ephemeral_result_rows
 from runtime.interface import WarehouseClient
 from runtime.admission import check_admission, record_query_outcome, get_warehouse_snapshot
 from runtime.cache import lookup_cache, write_cache, load_cached_rows
@@ -147,8 +148,6 @@ def _resolve_result_row_retention(
     temporary_full_rows_max: int | None = None,
 ) -> tuple[str, dict[str, Any] | None, str | None]:
     requested = bool(request.get("persist_result_rows"))
-    if not requested:
-        return "preview_only", None, None
     sql = request.get("sql")
     if not isinstance(sql, str) or not sql.strip():
         return "preview_only", None, "row retention denied because request sql is missing"
@@ -161,7 +160,13 @@ def _resolve_result_row_retention(
             continue
         if "warehouse_identity" in policy and policy["warehouse_identity"] != warehouse_identity:
             continue
+        if not requested:
+            if policy["retention_mode"] == "deny":
+                return "deny", policy, "row retention denied by runtime policy"
+            return "preview_only", policy, None
         return str(policy["retention_mode"]), policy, None
+    if not requested:
+        return "preview_only", None, None
     if isinstance(temporary_full_rows_max, int) and temporary_full_rows_max > 0:
         return (
             "full_rows",
@@ -216,6 +221,44 @@ def apply_result_row_retention(
     if isinstance(retention_policy, dict) and isinstance(retention_policy.get("redaction_profile"), dict):
         metadata["redaction_profile"] = dict(retention_policy["redaction_profile"])
     return retained_rows, metadata, retention_denial_reason
+
+
+def _rows_preview_for_retention(
+    rows: list[dict[str, Any]],
+    *,
+    retention_mode: str,
+    retention_policy: dict[str, Any] | None,
+    retained_rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if retention_mode == "deny":
+        return []
+    if isinstance(retained_rows, list):
+        return [dict(row) for row in retained_rows[:10] if isinstance(row, dict)]
+    preview_rows = [dict(row) for row in rows[:10] if isinstance(row, dict)]
+    if isinstance(retention_policy, dict) and isinstance(retention_policy.get("redaction_profile"), dict):
+        return _redact_rows(preview_rows, retention_policy["redaction_profile"])
+    return preview_rows
+
+
+def _ephemeral_rows_for_chart_render(
+    rows: list[dict[str, Any]],
+    *,
+    retention_mode: str,
+    retention_policy: dict[str, Any] | None,
+    retained_rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    if retention_mode == "deny":
+        return None
+    if retention_mode == "redacted_rows":
+        return list(retained_rows) if isinstance(retained_rows, list) else _redact_rows(
+            list(rows),
+            retention_policy.get("redaction_profile") if retention_policy else None,
+        )
+    if retention_mode == "full_rows" and isinstance(retained_rows, list):
+        return list(retained_rows)
+    if isinstance(retention_policy, dict) and isinstance(retention_policy.get("redaction_profile"), dict):
+        return _redact_rows(list(rows), retention_policy["redaction_profile"])
+    return list(rows)
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -399,28 +442,36 @@ def execute_query_request(
         max_rows=max_rows,
         max_cache_age_seconds=max_cache_age_seconds,
     )
+    warehouse_identity = client.identity
+    source_rows = [row for row in detailed["result_rows"] if isinstance(row, dict)]
+    retention_mode, retention_policy, retention_denial_reason = _resolve_result_row_retention(
+        request,
+        warehouse_identity=warehouse_identity,
+        temporary_full_rows_max=temporary_full_rows_max,
+    )
+    retained_rows, retention_metadata, retention_denial_reason = apply_result_row_retention(
+        request,
+        source_rows,
+        warehouse_identity=warehouse_identity,
+        temporary_full_rows_max=temporary_full_rows_max,
+    )
+    rows_preview = _rows_preview_for_retention(
+        source_rows,
+        retention_mode=retention_mode,
+        retention_policy=retention_policy,
+        retained_rows=retained_rows,
+    )
     result = {
         "query_id": request["query_id"],
         "description": request["description"],
         "output_name": request["output_name"],
         "status": detailed["status"],
-        "rows_preview": detailed["rows_preview"],
+        "rows_preview": rows_preview,
         "row_count": detailed["row_count"],
         "cost_class": detailed["cost_class"],
         "source": detailed["source"],
         "notes": list(detailed["notes"]),
     }
-    retention_mode, retention_policy, retention_denial_reason = _resolve_result_row_retention(
-        request,
-        warehouse_identity=client.identity,
-        temporary_full_rows_max=temporary_full_rows_max,
-    )
-    retained_rows, retention_metadata, retention_denial_reason = apply_result_row_retention(
-        request,
-        list(detailed["result_rows"]),
-        warehouse_identity=client.identity,
-        temporary_full_rows_max=temporary_full_rows_max,
-    )
     if isinstance(retained_rows, list):
         result["result_rows"] = retained_rows
         result["result_rows_persisted"] = True
@@ -429,11 +480,24 @@ def execute_query_request(
     result.update(retention_metadata)
     if retention_denial_reason:
         result["notes"].append(retention_denial_reason)
+    if detailed["status"] in {"success", "cached", "degraded_to_cache"}:
+        register_ephemeral_result_rows(
+            slug,
+            session_id=session_id,
+            round_number=round_number,
+            query_id=request["query_id"],
+            rows=_ephemeral_rows_for_chart_render(
+                source_rows,
+                retention_mode=retention_mode,
+                retention_policy=retention_policy,
+                retained_rows=retained_rows,
+            ),
+        )
     cache_write_rows: list[dict[str, Any]] | None = None
     cache_skip_reason: str | None = None
     if bool(request.get("persist_result_rows")):
         cache_write_rows, cache_skip_reason = _resolve_cache_write_payload(
-            detailed["result_rows"],
+            source_rows,
             retention_mode=retention_mode,
             retention_policy=retention_policy,
         )

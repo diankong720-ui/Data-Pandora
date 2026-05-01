@@ -111,7 +111,8 @@ Required fields:
 Enumerations:
 
 - `question_style`: `abstract | operational | comparative`
-- `business_object.entity_type`: `business_scope | channel | product | region | seller`
+- `business_object.entity_type`: `business_scope | channel | product | region | seller | device | machine | store | customer | merchant | category | sku | asset | location | other`
+  - This is the semantic business object, not a database table name. Use the closest known business entity; use `other` with the original label when schema discovery must disambiguate the entity type.
 - `time_scope.primary.grain`: `day | week | month | quarter | year | rolling_window | unknown`
 - `comparison_scope.type`: `none | mom | yoy | explicit | custom`
 - `mapping_confidence`: `high | low`

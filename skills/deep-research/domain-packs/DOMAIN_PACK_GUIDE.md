@@ -38,7 +38,7 @@ domain-packs/
   },
   "lexicon": {
     "metrics": [
-      { "canonical": "sales_amount", "aliases": ["revenue", "GMV"] },
+      { "canonical": "sales_amount", "aliases": ["revenue", "transaction value"] },
       { "canonical": "order_count", "aliases": ["orders", "transactions"] },
       { "canonical": "buyer_count", "aliases": ["buyers", "customers"] }
     ],

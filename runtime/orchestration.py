@@ -51,12 +51,10 @@ def execute_investigation_contract(
             raise ValueError(f"Duplicate output_name in InvestigationContract: {output_name}")
         seen_output_names.add(output_name)
 
-        runtime_request = dict(request)
-        runtime_request["persist_result_rows"] = True
         executed_queries.append(
             execute_query_request(
                 client,
-                runtime_request,
+                dict(request),
                 slug=slug,
                 session_id=session_id,
                 contract_id=str(contract["contract_id"]),
@@ -64,7 +62,6 @@ def execute_investigation_contract(
                 timeout=timeout,
                 max_rows=max_rows,
                 max_cache_age_seconds=max_cache_age_seconds,
-                temporary_full_rows_max=max_rows,
             )
         )
 

@@ -158,9 +158,6 @@ def _assert_stage_known(stage: str) -> None:
 def assert_stage_transition(state: dict[str, Any], stage: str) -> None:
     _assert_stage_known(stage)
     current_stage = state.get("current_stage")
-    stage_statuses = state.get("stage_statuses", {})
-    if stage_statuses.get(stage) == "completed":
-        return
     if current_stage != stage:
         raise StageOrderViolation(
             f"Cannot enter stage '{stage}' while current stage is '{current_stage}'.",
@@ -190,6 +187,7 @@ def complete_stage(
     session_id: str | None = None,
     frozen_artifact: str | None = None,
     artifact_payload: Any | None = None,
+    additional_frozen_artifacts: dict[str, Any] | None = None,
     latest_round_number: int | None = None,
     allow_terminal_completion: bool = False,
     next_stage_override: str | None = None,
@@ -199,6 +197,8 @@ def complete_stage(
     state["stage_statuses"][stage] = "completed"
     if frozen_artifact is not None and artifact_payload is not None:
         state["frozen_artifacts"][frozen_artifact] = _artifact_signature(artifact_payload)
+    for artifact_name, payload in (additional_frozen_artifacts or {}).items():
+        state["frozen_artifacts"][artifact_name] = _artifact_signature(payload)
     if latest_round_number is not None:
         state["latest_round_number"] = latest_round_number
     if stage == "finalization" and allow_terminal_completion:
@@ -517,6 +517,7 @@ def issue_continuation_token(
     evaluation: dict[str, Any],
     hypothesis_state_basis: str,
     allowed_target_hypotheses: list[str],
+    hypothesis_status_advisory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     if not evaluation.get("should_continue"):
@@ -542,6 +543,7 @@ def issue_continuation_token(
         "allowed_transition_type": recommended_next_action,
         "hypothesis_state_basis": hypothesis_state_basis,
         "allowed_target_hypotheses": allowed_target_hypotheses,
+        "hypothesis_status_advisory": dict(hypothesis_status_advisory or {}),
         "authorized_residual_component": continuation_guidance.get("primary_residual_component"),
         "authorized_open_question_ids": priority_open_questions,
         "issued_at": time.time(),
@@ -582,19 +584,31 @@ def mark_restart(
     session_id: str | None = None,
     reason: str | None = None,
     prior_intent_hash: str | None = None,
+    triggering_generation_id: str | None = None,
+    triggering_round_number: int | None = None,
+    triggering_round_id: str | None = None,
+    triggering_evaluation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     prior_generation_id = str(state.get("active_generation_id", "gen_1"))
     next_generation_id = f"gen_{int(state.get('restart_count', 0)) + 2}"
-    state.setdefault("restart_history", []).append(
-        {
-            "reason": reason or "restart_requested",
-            "prior_intent_hash": prior_intent_hash,
-            "from_generation_id": prior_generation_id,
-            "to_generation_id": next_generation_id,
-            "timestamp": time.time(),
-        }
-    )
+    history_entry = {
+        "reason": reason or "restart_requested",
+        "prior_intent_hash": prior_intent_hash,
+        "from_generation_id": prior_generation_id,
+        "to_generation_id": next_generation_id,
+        "timestamp": time.time(),
+    }
+    if triggering_generation_id:
+        history_entry["triggering_generation_id"] = triggering_generation_id
+    if triggering_round_number is not None:
+        history_entry["triggering_round_number"] = triggering_round_number
+    if triggering_round_id:
+        history_entry["triggering_round_id"] = triggering_round_id
+    if isinstance(triggering_evaluation, dict):
+        history_entry["triggering_evaluation_hash"] = _artifact_signature(triggering_evaluation)
+        history_entry["triggering_evaluation"] = dict(triggering_evaluation)
+    state.setdefault("restart_history", []).append(history_entry)
     state["restart_count"] = int(state.get("restart_count", 0)) + 1
     state["active_generation_id"] = next_generation_id
     state["current_stage"] = "intent"

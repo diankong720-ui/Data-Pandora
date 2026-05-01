@@ -135,12 +135,10 @@ class HttpSqlClient(WarehouseClient):
 
 class SqlAlchemyClient(WarehouseClient):
     """
-    Generic SQLAlchemy client. Works with PostgreSQL, MySQL, SQLite, BigQuery, etc.
+    Generic SQLAlchemy client for common SQL databases and cloud warehouses.
 
     Install extras:
-        pip install sqlalchemy psycopg2-binary   # PostgreSQL
-        pip install sqlalchemy pymysql           # MySQL
-        pip install sqlalchemy-bigquery          # BigQuery
+        pip install sqlalchemy <driver-package>
 
     Required environment variables:
         WAREHOUSE_DSN       SQLAlchemy connection string
@@ -176,8 +174,8 @@ class SqlAlchemyClient(WarehouseClient):
     ) -> QueryResult:
         # execution_options(timeout=...) is passed to the dialect as a hint.
         # Actual enforcement is driver-dependent:
-        #   - psycopg2 (PostgreSQL): respected via statement_timeout
-        #   - pymysql (MySQL): not natively enforced; consider SET SESSION wait_timeout
+        #   - some drivers respect statement-level timeout options
+        #   - other drivers require a session-level timeout configured by the host
         #   - sqlalchemy-bigquery: respected via job timeout
         #   - sqlite: not enforced
         # Test timeout behavior for your specific driver before relying on it.

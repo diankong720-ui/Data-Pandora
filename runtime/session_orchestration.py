@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -43,6 +44,7 @@ from runtime.protocol_guards import (
 )
 from runtime.persistence import (
     get_active_generation_id,
+    get_session_context,
     list_round_bundles,
     load_session_evidence,
     persist_artifact,
@@ -72,6 +74,7 @@ from runtime.session_state import (
     require_discovery_ready,
     require_evaluation_ready,
     FinalizationPreconditionViolation,
+    FrozenArtifactMutation,
     require_finalization_ready,
     require_intent_ready,
     require_orchestrated_entry,
@@ -84,6 +87,52 @@ from runtime.session_state import (
 )
 from runtime.visualization import assemble_report_artifacts, render_chart_artifacts
 from runtime.visualization import set_report_template
+
+
+def _artifact_path(slug: str, artifact_name: str, *, session_id: str | None) -> str:
+    context = get_session_context(slug, session_id=session_id, strict_session=bool(session_id))
+    return str(Path(context["session_root"]) / artifact_name)
+
+
+def _completed_stage_replay_path(
+    slug: str,
+    state: dict[str, Any],
+    *,
+    stage: str,
+    artifact_name: str,
+    payload: Any,
+    session_id: str | None,
+    additional_artifacts: dict[str, Any] | None = None,
+) -> str | None:
+    if state.get("stage_statuses", {}).get(stage) != "completed":
+        return None
+    existing_payload = read_artifact(slug, artifact_name, session_id=session_id, strict_session=True)
+    if existing_payload is None:
+        raise FrozenArtifactMutation(
+            f"Completed stage '{stage}' is missing frozen artifact {artifact_name}.",
+            current_stage=str(state.get("current_stage")),
+            blocking_artifacts=[artifact_name],
+            suggested_next_step="Inspect the session artifacts or restart instead of replaying this stage.",
+        )
+    guard_frozen_artifact(state, artifact_name, existing_payload)
+    if stable_payload_hash(existing_payload) != stable_payload_hash(payload):
+        raise FrozenArtifactMutation(
+            f"Completed stage '{stage}' cannot overwrite {artifact_name} with different content.",
+            current_stage=str(state.get("current_stage")),
+            blocking_artifacts=[artifact_name],
+            suggested_next_step="Use a restart flow instead of mutating a completed stage.",
+        )
+    for extra_name, extra_payload in (additional_artifacts or {}).items():
+        existing_extra = read_artifact(slug, extra_name, session_id=session_id, strict_session=True)
+        if existing_extra is None or stable_payload_hash(existing_extra) != stable_payload_hash(extra_payload):
+            raise FrozenArtifactMutation(
+                f"Completed stage '{stage}' cannot overwrite {extra_name} with different content.",
+                current_stage=str(state.get("current_stage")),
+                blocking_artifacts=[extra_name],
+                suggested_next_step="Use a restart flow instead of mutating a completed stage.",
+            )
+        guard_frozen_artifact(state, extra_name, existing_extra)
+    return _artifact_path(slug, artifact_name, session_id=session_id)
 
 
 def _stage_goal(stage: str) -> str:
@@ -388,12 +437,34 @@ def _read_effective_hypothesis_state(slug: str, *, session_id: str | None = None
 
 def _legal_target_hypotheses(slug: str, *, session_id: str | None = None) -> list[str]:
     effective_state = _read_effective_hypothesis_state(slug, session_id=session_id)
-    blocked_statuses = {"rejected", "not_tested"}
+    blocked_statuses = {"rejected"}
     return sorted(
         hypothesis_id
         for hypothesis_id, snapshot in effective_state.items()
         if snapshot.get("status") not in blocked_statuses
     )
+
+
+def _hypothesis_status_advisory(
+    slug: str,
+    *,
+    allowed_target_hypotheses: list[str],
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    effective_state = _read_effective_hypothesis_state(slug, session_id=session_id)
+    advisory: dict[str, Any] = {}
+    for hypothesis_id in allowed_target_hypotheses:
+        snapshot = effective_state.get(hypothesis_id, {})
+        status = snapshot.get("status")
+        item: dict[str, Any] = {"status": status or "unknown"}
+        if status == "not_tested":
+            item["warning"] = "not_tested_requires_new_evidence_path"
+            item["message"] = (
+                "This hypothesis has not been tested yet; continuation is allowed, "
+                "but the next contract should introduce a new evidence path or clarify schema feasibility."
+            )
+        advisory[hypothesis_id] = item
+    return advisory
 
 
 def _validate_round_2_plus_lineage(
@@ -529,6 +600,32 @@ def _validate_round_2_plus_lineage(
         raise InvalidContinuationToken(
             "Contract target_hypotheses are not legal under the authorized continuation snapshot.",
         )
+    hypothesis_status_advisory = token_payload.get("hypothesis_status_advisory")
+    if not isinstance(hypothesis_status_advisory, dict):
+        hypothesis_status_advisory = {}
+    not_tested_targets = [
+        hypothesis_id
+        for hypothesis_id in target_hypotheses
+        if isinstance(hypothesis_id, str)
+        and isinstance(hypothesis_status_advisory.get(hypothesis_id), dict)
+        and hypothesis_status_advisory[hypothesis_id].get("status") == "not_tested"
+    ]
+    if not_tested_targets:
+        append_protocol_gate_result(
+            slug,
+            {
+                "gate_id": "continuation.not_tested_target_soft_audit",
+                "severity": "soft_deviation",
+                "outcome": "observed",
+                "message": (
+                    "Round continuation targets not_tested hypotheses; accepted because "
+                    "not_tested is an evidence state rather than a safety violation."
+                ),
+                "refs": [str(contract.get("contract_id") or "contract")] + not_tested_targets,
+                "timestamp": time.time(),
+            },
+            session_id=session_id,
+        )
     parent_contract = latest_bundle.get("contract")
     if not isinstance(parent_contract, dict):
         raise InvalidContinuationToken(
@@ -612,6 +709,24 @@ def persist_intent_stage(
     session_id: str | None = None,
 ) -> dict[str, str]:
     require_orchestrated_entry(session_mode)
+    state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
+    validate_intent_recognition_result(intent_result)
+    validate_intent_stage_payload(slug, intent_result, session_id=session_id)
+    normalized_intent = intent_result["normalized_intent"]
+    replay_path = _completed_stage_replay_path(
+        slug,
+        state,
+        stage="intent",
+        artifact_name="intent.json",
+        payload=normalized_intent,
+        additional_artifacts={"intent_sidecar.json": {"pack_gaps": intent_result["pack_gaps"]}},
+        session_id=session_id,
+    )
+    if replay_path is not None:
+        return {
+            "intent_path": replay_path,
+            "intent_sidecar_path": _artifact_path(slug, "intent_sidecar.json", session_id=session_id),
+        }
     set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
     state = begin_stage(slug, "intent", session_mode=session_mode, session_id=session_id)
     _record_stage_decision(
@@ -622,9 +737,6 @@ def persist_intent_stage(
         session_mode=session_mode,
         session_id=session_id,
     )
-    validate_intent_recognition_result(intent_result)
-    validate_intent_stage_payload(slug, intent_result, session_id=session_id)
-    normalized_intent = intent_result["normalized_intent"]
     if (
         state.get("restart_count", 0) == 0
         and read_artifact(slug, "intent.json", session_id=session_id, strict_session=True) is not None
@@ -674,6 +786,22 @@ def persist_discovery_stage(
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     require_intent_ready(slug, state, session_id=session_id)
     validate_intent_ready_for_downstream(slug, session_id=session_id)
+    validate_data_context_bundle(discovery_bundle)
+    validate_discovery_stage_payload(slug, discovery_bundle, session_id=session_id)
+    existing_intent = read_artifact(slug, "intent.json", session_id=session_id, strict_session=True)
+    if existing_intent is None:
+        require_intent_ready(slug, state, session_id=session_id)
+    guard_frozen_artifact(state, "intent.json", existing_intent)
+    replay_path = _completed_stage_replay_path(
+        slug,
+        state,
+        stage="discovery",
+        artifact_name="environment_scan.json",
+        payload=discovery_bundle,
+        session_id=session_id,
+    )
+    if replay_path is not None:
+        return replay_path
     set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
     state = begin_stage(slug, "discovery", session_mode=session_mode, session_id=session_id)
     _record_stage_decision(
@@ -684,12 +812,6 @@ def persist_discovery_stage(
         session_mode=session_mode,
         session_id=session_id,
     )
-    validate_data_context_bundle(discovery_bundle)
-    validate_discovery_stage_payload(slug, discovery_bundle, session_id=session_id)
-    existing_intent = read_artifact(slug, "intent.json", session_id=session_id, strict_session=True)
-    if existing_intent is None:
-        require_intent_ready(slug, state, session_id=session_id)
-    guard_frozen_artifact(state, "intent.json", existing_intent)
     path = persist_artifact(
         slug,
         "environment_scan.json",
@@ -697,7 +819,14 @@ def persist_discovery_stage(
         session_id=session_id,
         strict_session=True,
     )
-    complete_stage(slug, "discovery", session_mode=session_mode, session_id=session_id)
+    complete_stage(
+        slug,
+        "discovery",
+        session_mode=session_mode,
+        session_id=session_id,
+        frozen_artifact="environment_scan.json",
+        artifact_payload=discovery_bundle,
+    )
     _record_stage_decision(
         slug,
         stage="discovery",
@@ -719,6 +848,28 @@ def persist_plan_stage(
     require_orchestrated_entry(session_mode)
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     require_discovery_ready(slug, state, session_id=session_id)
+    validate_plan_bundle(plan_bundle)
+    validate_plan_stage_payload(slug, plan_bundle, session_id=session_id)
+    guard_frozen_artifact(
+        state,
+        "intent.json",
+        read_artifact(slug, "intent.json", session_id=session_id, strict_session=True),
+    )
+    guard_frozen_artifact(
+        state,
+        "environment_scan.json",
+        read_artifact(slug, "environment_scan.json", session_id=session_id, strict_session=True),
+    )
+    replay_path = _completed_stage_replay_path(
+        slug,
+        state,
+        stage="planning",
+        artifact_name="plan.json",
+        payload=plan_bundle,
+        session_id=session_id,
+    )
+    if replay_path is not None:
+        return replay_path
     set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
     state = begin_stage(slug, "planning", session_mode=session_mode, session_id=session_id)
     _record_stage_decision(
@@ -728,13 +879,6 @@ def persist_plan_stage(
         next_stage="planning",
         session_mode=session_mode,
         session_id=session_id,
-    )
-    validate_plan_bundle(plan_bundle)
-    validate_plan_stage_payload(slug, plan_bundle, session_id=session_id)
-    guard_frozen_artifact(
-        state,
-        "intent.json",
-        read_artifact(slug, "intent.json", session_id=session_id, strict_session=True),
     )
     path = persist_artifact(
         slug,
@@ -921,6 +1065,7 @@ def persist_round_evaluation_stage(
         executed_queries=bundle["executed_queries"],
     )
     validate_evaluation_stage_payload(slug, evaluation_result, session_id=session_id)
+    triggering_generation_id = get_active_generation_id(slug, session_id=session_id, strict_session=bool(session_id))
     path = persist_round_evaluation(
         slug,
         evaluation_result,
@@ -949,13 +1094,19 @@ def persist_round_evaluation_stage(
     )
     if evaluation_result.get("should_continue") and evaluation_result.get("recommended_next_action") in {"refine", "pivot"}:
         hypothesis_state_basis = stable_payload_hash(_read_effective_hypothesis_state(slug, session_id=session_id))
+        allowed_target_hypotheses = _legal_target_hypotheses(slug, session_id=session_id)
         issue_continuation_token(
             slug,
             session_mode=session_mode,
             session_id=session_id,
             evaluation=evaluation_result,
             hypothesis_state_basis=hypothesis_state_basis,
-            allowed_target_hypotheses=_legal_target_hypotheses(slug, session_id=session_id),
+            allowed_target_hypotheses=allowed_target_hypotheses,
+            hypothesis_status_advisory=_hypothesis_status_advisory(
+                slug,
+                allowed_target_hypotheses=allowed_target_hypotheses,
+                session_id=session_id,
+            ),
         )
     if evaluation_result.get("recommended_next_action") == "restart":
         intent_payload = read_artifact(slug, "intent.json", session_id=session_id, strict_session=True)
@@ -966,6 +1117,10 @@ def persist_round_evaluation_stage(
             session_id=session_id,
             reason=evaluation_result.get("stop_reason"),
             prior_intent_hash=prior_intent_hash,
+            triggering_generation_id=triggering_generation_id,
+            triggering_round_number=round_number,
+            triggering_round_id=str(evaluation_result.get("round_id") or f"round_{round_number}"),
+            triggering_evaluation=evaluation_result,
         )
     return path
 
@@ -982,25 +1137,6 @@ def persist_finalization_stage(
     require_orchestrated_entry(session_mode)
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     require_evaluation_ready(slug, state, session_id=session_id)
-    set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
-    state = begin_stage(slug, "finalization", session_mode=session_mode, session_id=session_id)
-    _record_stage_decision(
-        slug,
-        stage="finalization",
-        phase="enter",
-        next_stage="finalization",
-        session_mode=session_mode,
-        session_id=session_id,
-    )
-    rationale = action_rationale or _autofill_action_rationale(
-        current_stage="finalization",
-        action_type="final_answer_synthesis",
-        purpose="Persist the evidence-backed final answer and explicit report evidence bundle.",
-        expected_output_type="final_answer_and_report_evidence",
-        artifact_impact=["final_answer.json", "report_evidence.json", "report_evidence_index.json"],
-        why_not_a_later_stage_claim="This action freezes conclusion semantics and report evidence semantics without creating new evidence.",
-    )
-    append_action_rationale(slug, rationale, session_id=session_id)
     latest_evaluation = get_latest_round_evaluation(slug, session_id=session_id)
     validate_final_answer(
         final_answer,
@@ -1020,6 +1156,40 @@ def persist_finalization_stage(
         report_evidence,
         session_id=session_id,
     )
+    report_evidence_index = _build_report_evidence_index(slug, report_evidence, session_id=session_id or "legacy")
+    replay_path = _completed_stage_replay_path(
+        slug,
+        state,
+        stage="finalization",
+        artifact_name="final_answer.json",
+        payload=final_answer,
+        additional_artifacts={
+            "report_evidence.json": report_evidence,
+            "report_evidence_index.json": report_evidence_index,
+        },
+        session_id=session_id,
+    )
+    if replay_path is not None:
+        return replay_path
+    set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
+    state = begin_stage(slug, "finalization", session_mode=session_mode, session_id=session_id)
+    _record_stage_decision(
+        slug,
+        stage="finalization",
+        phase="enter",
+        next_stage="finalization",
+        session_mode=session_mode,
+        session_id=session_id,
+    )
+    rationale = action_rationale or _autofill_action_rationale(
+        current_stage="finalization",
+        action_type="final_answer_synthesis",
+        purpose="Persist the evidence-backed final answer and explicit report evidence bundle.",
+        expected_output_type="final_answer_and_report_evidence",
+        artifact_impact=["final_answer.json", "report_evidence.json", "report_evidence_index.json"],
+        why_not_a_later_stage_claim="This action freezes conclusion semantics and report evidence semantics without creating new evidence.",
+    )
+    append_action_rationale(slug, rationale, session_id=session_id)
     path = persist_final_answer(slug, final_answer, session_id=session_id)
     persist_artifact(
         slug,
@@ -1028,7 +1198,6 @@ def persist_finalization_stage(
         session_id=session_id,
         strict_session=True,
     )
-    report_evidence_index = _build_report_evidence_index(slug, report_evidence, session_id=session_id or "legacy")
     persist_artifact(
         slug,
         "report_evidence_index.json",
@@ -1043,6 +1212,10 @@ def persist_finalization_stage(
         session_id=session_id,
         frozen_artifact="final_answer.json",
         artifact_payload=final_answer,
+        additional_frozen_artifacts={
+            "report_evidence.json": report_evidence,
+            "report_evidence_index.json": report_evidence_index,
+        },
         next_stage_override="chart_spec",
     )
     _record_stage_decision(
@@ -1067,6 +1240,18 @@ def persist_chart_spec_stage(
     require_orchestrated_entry(session_mode)
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     require_finalization_ready(slug, state, session_id=session_id)
+    validate_chart_spec_bundle(chart_spec_bundle)
+    validate_chart_spec_stage_payload(slug, chart_spec_bundle, session_id=session_id)
+    replay_path = _completed_stage_replay_path(
+        slug,
+        state,
+        stage="chart_spec",
+        artifact_name="chart_spec_bundle.json",
+        payload=chart_spec_bundle,
+        session_id=session_id,
+    )
+    if replay_path is not None:
+        return replay_path
     set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
     begin_stage(slug, "chart_spec", session_mode=session_mode, session_id=session_id)
     _record_stage_decision(
@@ -1086,8 +1271,6 @@ def persist_chart_spec_stage(
         why_not_a_later_stage_claim="This action proposes chart interpretations but does not render or create new evidence.",
     )
     append_action_rationale(slug, rationale, session_id=session_id)
-    validate_chart_spec_bundle(chart_spec_bundle)
-    validate_chart_spec_stage_payload(slug, chart_spec_bundle, session_id=session_id)
     path = persist_artifact(
         slug,
         "chart_spec_bundle.json",
@@ -1100,6 +1283,8 @@ def persist_chart_spec_stage(
         "chart_spec",
         session_mode=session_mode,
         session_id=session_id,
+        frozen_artifact="chart_spec_bundle.json",
+        artifact_payload=chart_spec_bundle,
         next_stage_override="chart_render",
     )
     _record_stage_decision(
@@ -1121,6 +1306,7 @@ def persist_chart_render_stage(
     session_mode: str = SESSION_MODE_ORCHESTRATED_ONLY,
     session_id: str | None = None,
     rehydrate_missing_result_rows: bool = False,
+    temporary_visualization_rows_max: int | None = None,
     timeout: float = 30.0,
     max_rows: int = 10_000,
     max_cache_age_seconds: float | None = None,
@@ -1128,6 +1314,23 @@ def persist_chart_render_stage(
     require_orchestrated_entry(session_mode)
     state = ensure_session_state(slug, session_mode=session_mode, session_id=session_id)
     require_chart_spec_ready(slug, state, session_id=session_id)
+    if state.get("stage_statuses", {}).get("chart_render") == "completed":
+        descriptive_stats = read_artifact(slug, "descriptive_stats.json", session_id=session_id, strict_session=True)
+        visualization_manifest = read_artifact(
+            slug,
+            "visualization_manifest.json",
+            session_id=session_id,
+            strict_session=True,
+        )
+        if isinstance(descriptive_stats, dict) and isinstance(visualization_manifest, dict):
+            guard_frozen_artifact(state, "descriptive_stats.json", descriptive_stats)
+            guard_frozen_artifact(state, "visualization_manifest.json", visualization_manifest)
+            return {
+                "descriptive_stats": descriptive_stats,
+                "descriptive_stats_path": _artifact_path(slug, "descriptive_stats.json", session_id=session_id),
+                "visualization_manifest": visualization_manifest,
+                "visualization_manifest_path": _artifact_path(slug, "visualization_manifest.json", session_id=session_id),
+            }
     set_transition_mode(slug, "normal", session_mode=session_mode, session_id=session_id)
     begin_stage(slug, "chart_render", session_mode=session_mode, session_id=session_id)
     _record_stage_decision(
@@ -1157,6 +1360,7 @@ def persist_chart_render_stage(
         client=client,
         session_id=session_id,
         rehydrate_missing_result_rows=rehydrate_missing_result_rows,
+        temporary_visualization_rows_max=temporary_visualization_rows_max,
         timeout=timeout,
         max_rows=max_rows,
         max_cache_age_seconds=max_cache_age_seconds,
@@ -1168,6 +1372,9 @@ def persist_chart_render_stage(
         "chart_render",
         session_mode=session_mode,
         session_id=session_id,
+        frozen_artifact="visualization_manifest.json",
+        artifact_payload=bundle["visualization_manifest"],
+        additional_frozen_artifacts={"descriptive_stats.json": bundle["descriptive_stats"]},
         next_stage_override="report_assembly",
     )
     _record_stage_decision(
@@ -1397,15 +1604,17 @@ def run_research_session(
         )
         persist_round_evaluation_stage(slug, evaluation_result, session_mode=session_mode, session_id=session_id)
         if evaluation_result.get("recommended_next_action") == "restart":
-            latest_restart_evaluation = get_latest_round_evaluation(slug, session_id=session_id)
             restart_state = read_session_state(slug, session_id=session_id)
+            restart_history = restart_state.get("restart_history", []) if isinstance(restart_state, dict) else []
+            restart_history_entry = restart_history[-1] if restart_history else None
             return {
                 "status": "restart_required",
                 "next_stage": "intent",
                 "slug": slug,
                 "session_id": session_id,
                 "session_root": session_info["session_root"],
-                "latest_round_evaluation": latest_restart_evaluation,
+                "latest_round_evaluation": evaluation_result,
+                "restart_history_entry": restart_history_entry,
                 "blocking_artifacts": [f"rounds/round_{evaluation_result['round_number']}.json"],
                 "suggested_next_step": "Regenerate intent/discovery/plan under the restart flow before continuing.",
                 "session_state": restart_state,

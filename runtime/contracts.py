@@ -5,7 +5,23 @@ import json
 from typing import Any
 
 QUESTION_STYLES = {"abstract", "operational", "comparative"}
-BUSINESS_OBJECT_ENTITY_TYPES = {"business_scope", "channel", "product", "region", "seller"}
+BUSINESS_OBJECT_ENTITY_TYPES = {
+    "business_scope",
+    "channel",
+    "product",
+    "region",
+    "seller",
+    "device",
+    "machine",
+    "store",
+    "customer",
+    "merchant",
+    "category",
+    "sku",
+    "asset",
+    "location",
+    "other",
+}
 TIME_GRAINS = {"day", "week", "month", "quarter", "year", "rolling_window", "unknown"}
 COMPARISON_SCOPE_TYPES = {"none", "mom", "yoy", "explicit", "custom"}
 MAPPING_CONFIDENCE_LEVELS = {"high", "low"}
@@ -853,9 +869,9 @@ def validate_chart_spec_bundle(bundle: dict[str, Any]) -> None:
         for item in spec["plot_data"]["items"]:
             if not isinstance(item, dict):
                 raise ValueError("ChartSpec.plot_data.items entries must be objects.")
-            _require_fields(item, ("item_id", "payload"), "ChartSpec.plot_data.item")
+            _require_fields(item, ("item_id",), "ChartSpec.plot_data.item")
             _require_non_empty_string(item["item_id"], "ChartSpec.plot_data.item.item_id")
-            if not isinstance(item["payload"], dict):
+            if "payload" in item and not isinstance(item["payload"], dict):
                 raise ValueError("ChartSpec.plot_data.item.payload must be an object.")
             if "source_row_index" in item and not isinstance(item["source_row_index"], int):
                 raise ValueError("ChartSpec.plot_data.item.source_row_index must be an integer when provided.")
