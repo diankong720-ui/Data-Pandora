@@ -126,7 +126,10 @@ def _validate_continuation_guidance(
             )
 
 
-def summarize_execution_outcomes(executed_queries: list[dict[str, Any]]) -> dict[str, int]:
+def summarize_execution_outcomes(
+    executed_queries: list[dict[str, Any]],
+    executed_web_searches: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
     """Count execution outcomes by status family for evaluator/runtime guards."""
     summary = {
         "usable": 0,
@@ -159,17 +162,35 @@ def summarize_execution_outcomes(executed_queries: list[dict[str, Any]]) -> dict
             summary["timeout"] += 1
         elif status == "failed":
             summary["failed_status"] += 1
+    for search in executed_web_searches or []:
+        status = search.get("status")
+        if status == "success":
+            summary["usable"] += 1
+            summary["success"] += 1
+        elif status == "blocked":
+            summary["failed"] += 1
+            summary["blocked"] += 1
+        elif status == "timeout":
+            summary["failed"] += 1
+            summary["timeout"] += 1
+        else:
+            summary["failed"] += 1
+            if status == "failed":
+                summary["failed_status"] += 1
     return summary
 
 
-def blocked_runtime_preconditions_met(executed_queries: list[dict[str, Any]]) -> bool:
+def blocked_runtime_preconditions_met(
+    executed_queries: list[dict[str, Any]],
+    executed_web_searches: list[dict[str, Any]] | None = None,
+) -> bool:
     """
-    blocked_runtime is legal only when no usable evidence exists and runtime
-    blocking prevented execution.
+    blocked_runtime is legal only when no usable SQL/web evidence exists and
+    runtime blocking prevented execution.
     """
-    if not executed_queries:
+    if not executed_queries and not executed_web_searches:
         return False
-    summary = summarize_execution_outcomes(executed_queries)
+    summary = summarize_execution_outcomes(executed_queries, executed_web_searches)
     return summary["usable"] == 0 and summary["blocked"] > 0 and summary["degraded"] == 0
 
 
@@ -178,6 +199,7 @@ def validate_round_evaluation_result(
     *,
     contract: dict[str, Any] | None = None,
     executed_queries: list[dict[str, Any]] | None = None,
+    executed_web_searches: list[dict[str, Any]] | None = None,
 ) -> None:
     missing = [field for field in ROUND_EVALUATION_REQUIRED_FIELDS if field not in evaluation]
     if missing:
@@ -234,9 +256,12 @@ def validate_round_evaluation_result(
             raise ValueError("RoundEvaluationResult.round_number must match the persisted contract.")
 
     if evaluation["conclusion_state"] == "blocked_runtime":
-        if executed_queries is None or not blocked_runtime_preconditions_met(executed_queries):
+        if executed_queries is None or not blocked_runtime_preconditions_met(
+            executed_queries,
+            executed_web_searches,
+        ):
             raise ValueError(
-                "blocked_runtime requires zero usable evidence and at least one runtime-blocked query."
+                "blocked_runtime requires zero usable evidence and at least one runtime-blocked evidence request."
             )
 
     if evaluation["should_continue"] and evaluation["recommended_next_action"] in {"stop", "restart"}:
@@ -314,6 +339,8 @@ def persist_round_evaluation(
     *,
     contract: dict[str, Any] | None = None,
     executed_queries: list[dict[str, Any]] | None = None,
+    executed_web_searches: list[dict[str, Any]] | None = None,
+    web_recall_assessments: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
 ) -> str:
     """
@@ -336,11 +363,19 @@ def persist_round_evaluation(
         contract = existing_bundle.get("contract")
     if executed_queries is None and existing_bundle is not None:
         executed_queries = existing_bundle.get("executed_queries")
+    if executed_web_searches is None and existing_bundle is not None:
+        executed_web_searches = existing_bundle.get("executed_web_searches", [])
+    if web_recall_assessments is None and existing_bundle is not None:
+        web_recall_assessments = existing_bundle.get("web_recall_assessments", [])
 
     if not isinstance(contract, dict):
         raise ValueError("persist_round_evaluation requires a contract or an existing round bundle.")
     if not isinstance(executed_queries, list):
         raise ValueError("persist_round_evaluation requires executed_queries or an existing round bundle.")
+    if not isinstance(executed_web_searches, list):
+        raise ValueError("persist_round_evaluation requires executed_web_searches to be a list when provided.")
+    if not isinstance(web_recall_assessments, list):
+        raise ValueError("persist_round_evaluation requires web_recall_assessments to be a list when provided.")
     if isinstance(existing_bundle, dict) and isinstance(existing_bundle.get("executed_queries"), list):
         executed_queries = _preserve_query_retention_state(
             executed_queries,
@@ -351,6 +386,7 @@ def persist_round_evaluation(
         evaluation,
         contract=contract,
         executed_queries=executed_queries,
+        executed_web_searches=executed_web_searches,
     )
     return persist_round_bundle(
         slug,
@@ -358,6 +394,8 @@ def persist_round_evaluation(
         contract,
         executed_queries,
         evaluation,
+        executed_web_searches=executed_web_searches,
+        web_recall_assessments=web_recall_assessments,
         session_id=session_id,
         strict_session=bool(session_id),
     )

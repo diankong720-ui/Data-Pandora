@@ -111,8 +111,7 @@ Required fields:
 Enumerations:
 
 - `question_style`: `abstract | operational | comparative`
-- `business_object.entity_type`: `business_scope | channel | product | region | seller | device | machine | store | customer | merchant | category | sku | asset | location | other`
-  - This is the semantic business object, not a database table name. Use the closest known business entity; use `other` with the original label when schema discovery must disambiguate the entity type.
+- `business_object.entity_type`: `business_scope | channel | product | region | seller`
 - `time_scope.primary.grain`: `day | week | month | quarter | year | rolling_window | unknown`
 - `comparison_scope.type`: `none | mom | yoy | explicit | custom`
 - `mapping_confidence`: `high | low`
@@ -279,6 +278,10 @@ Produced by Stage 3 `hypothesis-engine`.
   "statement": "The observed decline is affected by scope or business-object mismatch.",
   "relevance_score": 0.72,
   "evidence_basis": "Question asks why sales dropped; discovery found two candidate sales fact tables and a conflict hint.",
+  "evidence_channel_plan": {
+    "lanes": ["warehouse_sql", "web_search"],
+    "rationale": "SQL can verify the internal movement while web search can test external market or policy mechanisms."
+  },
   "schema_feasibility": "feasible",
   "status": "proposed",
   "query_plan": [
@@ -304,7 +307,8 @@ Enumerations:
 Rules:
 
 - `query_plan` is explanatory planning metadata. It is not the execution surface.
-- Execution uses `InvestigationContract.queries[]` only.
+- Execution uses `InvestigationContract.queries[]` and `InvestigationContract.web_searches[]` only.
+- `evidence_channel_plan` is optional for legacy plans, but newly authored plans should use it to mark whether the hypothesis is best tested by `warehouse_sql`, `web_search`, or both.
 
 ---
 
@@ -356,8 +360,12 @@ Produced by Stage 3 for Round 1 and by the orchestrator after each evaluation fo
   "operator_id": "audit_baseline",
   "target_hypotheses": ["H1", "H2"],
   "sql_budget": 2,
+  "evidence_lanes": ["warehouse_sql", "web_search"],
+  "web_search_budget": 2,
+  "web_refinement_budget": 1,
   "allowed_cost_classes": ["cheap"],
   "queries": [],
+  "web_searches": [],
   "pass_conditions": [
     "Primary metric exists for the intended scope.",
     "No restart-worthy scope mismatch is found."
@@ -375,12 +383,16 @@ Required fields:
 
 - All top-level fields shown above are required.
 - `queries` is a list of `QueryExecutionRequest`.
+- `web_searches` is an optional list of `WebSearchRequest`.
+- `evidence_lanes`, `web_search_budget`, and `web_refinement_budget` are optional for SQL-only legacy contracts and required when `web_searches` is non-empty.
 
 Rules:
 
 - `round_number = 1` must be audit-first.
 - Round 1 target hypotheses must all come from the audit layer.
 - `queries[]` must be directly executable without downstream inference.
+- `web_searches[]` must be directly executable search requests without downstream query rewriting.
+- Web search is a peer evidence lane, not a fallback after SQL residual is high.
 - For Round 2+, `continuation_basis` must bind the contract to the latest evaluation's prioritized open questions and residual target.
 - For Round 2+, `material_change_reason` is required. It must name changed axes,
   explain why the change is material, state how it can reduce residual
@@ -448,6 +460,112 @@ Rules:
 
 - `result_rows` contains the persisted session evidence used by downstream reporting.
 - Visualization/report stages may consume `result_rows`, but must not reinterpret them as new claims on their own.
+
+## 9a. WebSearchRequest
+
+Produced inside `InvestigationContract.web_searches[]`.
+
+```json
+{
+  "search_id": "w_round2_policy_context",
+  "question": "Did a regional policy or market event plausibly affect the sales decline window?",
+  "query": "Shanghai beverage sales policy change March 2026",
+  "time_window": {
+    "start": "2026-03-01",
+    "end": "2026-03-31"
+  },
+  "geo_scope": "Shanghai",
+  "entity_scope": ["beverage", "retail"],
+  "source_policy": {
+    "preferred_source_types": ["official", "news", "industry_data"],
+    "max_results": 5
+  },
+  "freshness_requirement": "Prefer sources published within or immediately before the metric window.",
+  "expected_signal": "Find external events whose timing and mechanism can explain the affected segment.",
+  "addresses_open_question_ids": ["oq_external_driver"],
+  "addresses_residual_component": "external_driver_attribution"
+}
+```
+
+Refinement requests must also include:
+
+- `parent_search_id`
+- `recall_gap`
+- `refined_question`
+- `changed_axes`
+- `expected_new_signal`
+
+Rules:
+
+- Every request must include a time window, entity scope, source policy, and residual/open-question binding.
+- Same-round refinement is legal only when authorized by a `WebRecallAssessment`.
+- Web requests may seek supporting or contradicting evidence; contradiction is not a recall failure by itself.
+
+## 9b. WebSearchResult
+
+Produced by runtime web search tools during Stage 4.
+
+```json
+{
+  "search_id": "w_round2_policy_context",
+  "question": "Did a regional policy or market event plausibly affect the sales decline window?",
+  "query": "Shanghai beverage sales policy change March 2026",
+  "status": "success",
+  "provider": "tavily",
+  "retrieved_at": 1770000000.0,
+  "results": [
+    {
+      "title": "Example source",
+      "url": "https://example.com/source",
+      "content": "Short provider-returned summary.",
+      "published_date": "2026-03-10"
+    }
+  ],
+  "fetched_pages": [],
+  "source_quality_notes": []
+}
+```
+
+Enumerations:
+
+- `status`: `success | failed | timeout | blocked`
+
+Rules:
+
+- Runtime must never persist API keys or provider secrets.
+- If no web provider is configured, requested searches are persisted as `blocked` evidence with explicit `web_search_unavailable` metadata.
+
+## 9c. WebRecallAssessment
+
+Produced after each web search result before evaluation uses it.
+
+Required score fields, each integer `0-5`:
+
+- `temporal_fit`
+- `entity_fit`
+- `source_authority`
+- `source_independence`
+- `corroboration_strength`
+- `specificity`
+- `freshness`
+- `retrieval_diversity`
+- `contradiction_signal`
+- `actionability`
+
+Conclusions:
+
+- `usable_supporting`
+- `usable_contradicting`
+- `usable_contextual`
+- `needs_refinement`
+- `insufficient`
+
+Rules:
+
+- SQL/web disagreement should usually raise `contradiction_signal`; it must not automatically lower source quality.
+- `needs_refinement = true` is legal only with `conclusion = needs_refinement`.
+- `usable_contradicting` must include a contradiction summary.
+- Refinement requests must reference the parent search and state the recall gap.
 
 ---
 
@@ -564,6 +682,8 @@ Produced when the investigation ends.
           "query_id": "q_round1_headline_primary"
         }
       ],
+      "web_refs": [],
+      "evidence_channels": ["warehouse_sql"],
       "evaluation_refs": ["round_1:evaluation"]
     }
   ],
@@ -586,10 +706,16 @@ Required fields:
 
 Rules:
 
-- Every supported claim must be traceable to specific query results.
+- Every supported claim must be traceable to specific SQL query results, web search results, evaluation lineage, or an explicit combination.
+- Claims may use `query_refs[]`, `web_refs[]`, `evaluation_refs[]`, or a combination.
+- Every claim must include `evidence_channels[]` so the answer explicitly marks SQL-only, web-only, or mixed support.
+- SQL-only claims must include `warehouse_sql` in `evidence_channels`.
+- Web-only claims must include `web_search` in `evidence_channels`.
+- Mixed SQL/web claims must mark `evidence_channels` as `mixed` or include both `warehouse_sql` and `web_search`.
 - `conclusion_state` must match the final `RoundEvaluationResult`.
 - `FinalAnswer` is illegal when the latest `RoundEvaluationResult` requires `recommended_next_action = restart` or `conclusion_state = restart_required`.
-- Every `supported_claims[]` entry must be an object with lineage via `query_refs[]`, `evaluation_refs[]`, or both.
+- Every `supported_claims[]` entry must be an object with lineage via `query_refs[]`, `web_refs[]`, `evaluation_refs[]`, or a combination.
+- Web-only claims can explain external events or mechanisms, but internal metric-impact claims require SQL or evaluation bridge lineage.
 - Lineage references must resolve to persisted round artifacts; fabricated references are invalid.
 - `contradictions[]` may be either:
   - a non-empty string, for display-only contradiction text
@@ -622,6 +748,7 @@ Each `entries[]` item must include:
 - `section`
 - `text`
 - `query_refs`
+- `web_refs`
 
 Optional fields:
 
@@ -633,9 +760,16 @@ Rules:
 
 - `section` is one of `supported_claims | contradictions | residual_context`
 - every `query_refs[]` entry must include `round_id` and `query_id`
+- every `web_refs[]` entry must include `round_id` and `search_id`
 - `ReportEvidenceBundle` is the only report-evidence source for chart admission; runtime must not reverse-engineer hidden report evidence from `FinalAnswer`
 
 ### ChartSpecBundle
+
+New producers must not infer chart fields directly from raw rows. Runtime first
+persists `chart_affordances.json`; the LLM selects `affordance_id` values in a
+visualization plan, and runtime compiles those selections into a
+`ChartSpecBundle`. Direct `ChartSpecBundle` persistence is a trusted legacy
+compatibility path, not the governed LLM chart-planning path.
 
 Required fields:
 
@@ -662,9 +796,17 @@ Each `specs[]` item must include:
 Optional fields:
 
 - `renderer_hint`
+- `affordance_id`
+- `dataset_id`
 
 Rules:
 
+- a chartable dataset is homogeneous: one query, one schema signature, one
+  shared set of guaranteed fields, one grain/semantic role
+- runtime splits mixed summary/trend/distribution/reconciliation rows before
+  exposing chart affordances
+- the LLM should choose from `chart_affordances[].affordance_id` and provide
+  only title/caption/report placement/narrative intent
 - the default target is a complete, directly renderable chart spec
 - `source_query_ref` must resolve to one persisted query result in the current session
 - v1 supports one source query result per chart; do not author multi-query fused charts
@@ -680,6 +822,71 @@ Rules:
   `area`, `histogram`, `box`, `heatmap`
 - chart render may temporarily retain source result rows, but must purge full rows after chart artifacts are produced
 - captions may explain or support persisted evidence, but must not introduce new conclusions
+
+### ChartAffordanceBundle
+
+Required fields:
+
+- `session_slug`
+- `session_id`
+- `datasets`
+- `chart_affordances`
+- `normalization_report`
+- `generated_at`
+
+Each `datasets[]` item includes:
+
+- `dataset_id`
+- `schema_signature`
+- `columns`
+- `guaranteed_fields`
+- `dimension_fields`
+- `measure_fields`
+- `grain`
+- `semantic_role`
+- `row_count`
+- `null_rates`
+- `eligible_chart_types`
+- `query_refs`
+- `evidence_refs`
+- `rows`
+- `status`
+
+Each `chart_affordances[]` item includes:
+
+- `affordance_id`
+- `dataset_id`
+- `chart_type`
+- `x_field`
+- `y_field`
+- `series_field`
+- `value_field`
+- `row_count`
+- `query_refs`
+- `evidence_refs`
+
+### VisualizationPlanBundle
+
+Required fields:
+
+- `session_slug`
+- `session_id`
+- `charts`
+- `generated_at`
+
+Each `charts[]` item should include:
+
+- `chart_id`
+- `affordance_id`
+- `title`
+- `caption`
+- `narrative_role`
+- `report_section`
+- `why_this_chart`
+
+The LLM must not provide field mappings, SQL, row filters, or dataset joins in
+this plan. Runtime rejects unknown `affordance_id` values with
+`plan_selected_invalid_affordance`.
 
 ### DescriptiveStatsBundle
 
@@ -900,6 +1107,8 @@ RESEARCH/<slug>/
                                        generation_id: string,
                                        contract: InvestigationContract,
                                        executed_queries: QueryExecutionResult[],
+                                       executed_web_searches: WebSearchResult[],
+                                       web_recall_assessments: WebRecallAssessment[],
                                        evaluation: RoundEvaluationResult
                                      }
       execution_log.json           -> execution metadata retained by the runtime

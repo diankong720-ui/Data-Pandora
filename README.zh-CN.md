@@ -1,216 +1,294 @@
-# Deep Research Runtime
+# Pandora：Deep Research Skill Family
 
-一套 contract-first 的证据型数据分析运行时。
+[English](README.md)
 
-Deep Research Runtime 面向长流程分析型 agent：它适合回答“为什么某个指标变化了？”、“哪个分组驱动了变化？”、“这个趋势是不是真的？”这类需要多轮验证、证据闭环和最终报告交付的问题。
+Pandora 是一套以 contract 为中心的 LLM 业务研究运行时。它适合回答：
 
-项目的核心分工很清楚：
+- 为什么某个指标变化了？
+- 哪个分组对变化贡献最大？
+- 这个运营趋势是真的，还是报表口径问题？
+- 当前数仓和外部证据是否足够支撑一个可靠答案？
 
-- LLM 负责业务语义、假设设计、SQL 编写、评估推理、图表意图和最终结论。
-- runtime 负责阶段顺序、contract 校验、SQL 执行、行级留存策略、artifact 落盘、lineage 校验、restart 处理、图表真实数据注入和合规产物。
-- host 系统负责数仓凭据、client adapter、live mode 授权、留存策略、报告策略，以及可选的 LLM callback 接入。
-
-这套设计让 deep research loop 可以基于证据继续、转向、停止或重启，同时保证每个结论和图表都能追溯到 runtime 持久化证据。
-
----
-
-## 为什么需要它
-
-很多数据 agent 容易走向两个极端：
-
-1. 让 LLM 自由发挥 SQL、结论和图表，但缺少稳定审计链路。
-2. 把太多分析规则写死在 runtime 里，迫使 LLM 适应不该硬编码的业务判断。
-
-本项目选择第三条路：**runtime 对协议和证据严格，对业务判断保持中立**。
+项目由用户侧 `deep-research` skill、严格的阶段 contract、Python runtime、
+SQL/web 证据执行、可视化生成和可审计报告组装组成。
 
 ```mermaid
 flowchart LR
-    User["用户提出分析问题"]
-    LLM["LLM：语义、假设、SQL、评估、叙事"]
-    Runtime["Runtime：协议、执行、lineage、策略、artifact"]
-    Warehouse["数仓 client：只读查询执行"]
-    Report["证据支撑的报告与图表"]
-
-    User --> LLM
-    LLM -->|"显式 artifact 和 contract"| Runtime
-    Runtime -->|"仅执行已校验 SQL"| Warehouse
-    Warehouse -->|"查询行和元数据"| Runtime
-    Runtime -->|"持久化证据"| LLM
-    Runtime --> Report
+  User["业务问题"] --> Skill["deep-research skill"]
+  Skill --> LLM["LLM 语义工作<br/>intent、hypotheses、SQL、evaluation、claims"]
+  Skill --> Runtime["Python runtime<br/>阶段顺序、校验、执行、持久化"]
+  Runtime --> Warehouse["数仓 SQL"]
+  Runtime --> Web["可选 web search"]
+  Runtime --> Artifacts["RESEARCH artifacts"]
+  Artifacts --> Charts["图表和 report.md"]
+  Charts --> User
 ```
 
----
+## Pandora 是什么
 
-## 设计理念
+Pandora 将业务推理和运行时治理分开。
 
-Deep research 不是“多跑几条 SQL，直到答案看起来很自信”。它是一种闭环研究纪律。
+| 责任方 | 职责 |
+| --- | --- |
+| LLM / skill protocol | 业务语义、假设设计、SQL 编写、web search 问题、评估推理、最终结论。 |
+| Runtime | 阶段顺序、contract 校验、SQL 与 web 执行、cache/admission 策略、artifact 落盘、lineage 校验、合规报告。 |
+| Host application | 数仓 client factory、可选 web provider、模型 callbacks、报告策略、调度或产品集成。 |
 
-| 原则 | Runtime 如何执行 | LLM 的自由度 |
-| --- | --- | --- |
-| 先验证 baseline，再提出 claim | Round 1 先验证分析框架是否成立，再提升驱动原因。 | LLM 仍然选择如何测试 baseline。 |
-| 研究边界明确 | 每轮执行必须由显式 `InvestigationContract` 管住。 | LLM 编写 contract 和 SQL。 |
-| 由 residual 驱动下一轮 | 继续必须有未解决问题和更好的下一步测试。 | LLM 决定 refine、pivot、stop 或 restart。 |
-| 证据可追溯 | 最终 claim 和图表必须指向已落盘 query lineage。 | LLM 决定 claim 含义和解释方式。 |
-| 局部降级优先 | 缺 rows、负载阻塞、图表不支持时只降级局部产物。 | 报告仍可带着诚实不确定性完成。 |
-| Host policy 优先于硬编码 | 留存、语言、live access、敏感数据处理都可配置。 | LLM 不需要迎合隐藏 runtime 偏好。 |
+Runtime 永远不会替模型选择表、join、filter、metric、hypothesis、图表语义或最终结论。它只执行和校验协议产出的显式 artifact。
 
----
+## 为什么需要它
 
-## 系统架构
+自由发挥式数据分析 agent 常见的问题很稳定：没验证指标就下 driver claim、静默改写 SQL、证据链丢失，或者把 partial evidence 说成确定结论。Pandora 用显式 contract 和已落盘证据约束这条工作流。
 
 ```mermaid
 flowchart TB
-    subgraph Skill["Skill 协议文档"]
-        Entry["skills/deep-research/SKILL.md"]
-        Contracts["references/contracts.md"]
-        Method["references/core-methodology.md"]
-        StageDocs["intent / discovery / planning / evaluation / visualization docs"]
-    end
+  Problem["指标变化或审计问题"]
+  Audit["Audit<br/>问题和分析框架是否成立？"]
+  Demand["Demand<br/>活动量是否变化？"]
+  Value["Value<br/>单次活动价值是否变化？"]
+  Structure["Structure<br/>结构占比是否变化？"]
+  Fulfillment["Fulfillment<br/>运营或供给侧是否解释变化？"]
+  Residual["Residual uncertainty<br/>算术残差 + 认知残差"]
+  Answer["证据支持的答案"]
 
-    subgraph Runtime["Python Runtime"]
-        State["session_state.py\nstage gates 与 freeze checks"]
-        ContractsPy["contracts.py\nschema validation"]
-        Tools["tools.py\nSQL execution 与 retention"]
-        Orchestration["session_orchestration.py\n端到端 stage persistence"]
-        Viz["visualization.py\nruntime chart materialization"]
-        Compliance["compliance.py\ntrace、evidence graph、audit"]
-    end
-
-    subgraph Host["Host Integration"]
-        Callbacks["produce_* callbacks\nLLM 或 replay adapter"]
-        Client["WarehouseClient alias"]
-        Policy["runtime/report/retention policy"]
-    end
-
-    subgraph Output["Session Artifacts"]
-        Round["round bundles"]
-        Evidence["report evidence 与 index"]
-        Charts["visualization manifest 与 charts"]
-        Report["report.md 与 compliance_report.json"]
-    end
-
-    Entry --> Contracts
-    Entry --> Method
-    Entry --> StageDocs
-    Contracts --> ContractsPy
-    Host --> Orchestration
-    Orchestration --> State
-    Orchestration --> ContractsPy
-    Orchestration --> Tools
-    Orchestration --> Viz
-    Orchestration --> Compliance
-    Tools --> Round
-    Compliance --> Evidence
-    Viz --> Charts
-    Evidence --> Report
-    Charts --> Report
+  Problem --> Audit
+  Audit --> Demand
+  Audit --> Value
+  Audit --> Structure
+  Audit --> Fulfillment
+  Demand --> Residual
+  Value --> Residual
+  Structure --> Residual
+  Fulfillment --> Residual
+  Residual -->|"refine 或 pivot"| Audit
+  Residual -->|"stop"| Answer
 ```
 
-主要 runtime 入口：
+## 仓库地图
 
-- [`scripts/deep_research_runtime.py`](scripts/deep_research_runtime.py)：本地 agent 和脚本化 stage handoff 使用的 bridge CLI。
-- [`runtime/session_orchestration.py`](runtime/session_orchestration.py)：`run_research_session(...)` host integration API。
-- [`runtime/tools.py`](runtime/tools.py)：查询执行、rows preview、行级留存、脱敏和 ephemeral row 注册。
-- [`runtime/visualization.py`](runtime/visualization.py)：图表数据 materialization、图表渲染和报告组装。
-- [`scripts/run_project_eval.py`](scripts/run_project_eval.py)：项目级 eval harness，覆盖协议、流程完成度、安全、稳定性和质量。
+```text
+Pandora-main/
+  README.md
+  README.zh-CN.md
+  requirements.txt
+  scripts/
+    deep_research_runtime.py        # local agents 和 host 使用的桥接 CLI。
+    example_sql_boundary_test.py    # Example 数仓边界测试脚本。
+  runtime/
+    contracts.py                    # 共享对象校验。
+    session_state.py                # 阶段顺序和 continuation gates。
+    session_orchestration.py         # 端到端 governed session helpers。
+    orchestration.py                # Contract 执行和 finalization。
+    tools.py                        # SQL 执行 helpers。
+    web_search.py                   # provider-neutral web evidence lane。
+    visualization.py                # 图表 affordances、渲染、报告组装。
+    compliance.py                   # protocol trace、evidence graph、audit report。
+    example_clients/                # Vendor HTTP、通用 HTTP、SQLAlchemy clients。
+  skills/
+    deep-research/SKILL.md          # 用户侧正式入口。
+    intent-recognition/SKILL.md     # Stage 1。
+    data-discovery/SKILL.md         # Stage 2。
+    data-visualization/SKILL.md     # Stage 7。
+  tests/
+    test_visualization_affordances.py
+    test_web_evidence_runtime.py
+```
 
----
+## 执行生命周期
 
-## Deep Research 执行流程
-
-协议是串行的。Stage 不能跳过、合并或被静默重写。
+协议是串行的。Stage 不能跳过、重排，也不能合并成自由发挥式回答。
 
 ```mermaid
 flowchart TD
-    Q["Question + current_date"]
-    I["1. Intent\nintent.json + intent_sidecar.json"]
-    D["2. Discovery\nenvironment_scan.json"]
-    P["3. Planning\nplan.json + round_1_contract"]
-    X["4. Execution\nround bundle + executed queries"]
-    E["5. Evaluation\nresidual state + next action"]
-    F["6. Finalization\nfinal_answer + report evidence"]
-    CS["7a. Chart Spec\nchart_spec_bundle.json"]
-    CR["7b. Chart Render\ndescriptive_stats + visualization_manifest"]
-    R["7c. Report Assembly\nreport.md + compliance_report"]
-    S["8. Suggestions\ndomain_pack_suggestions.json"]
+  Q["User question + current_date"]
+  S1["1. Intent Recognition<br/>intent.json + intent_sidecar.json"]
+  S2["2. Environment Discovery<br/>environment_scan.json"]
+  S3["3. Planning<br/>plan.json + round_1_contract"]
+  S4["4. Execution<br/>SQL/web evidence round bundle"]
+  S5["5. Evaluation<br/>residual update + next action"]
+  Continue{"Continue?"}
+  Restart{"Restart?"}
+  S6["6. Finalization<br/>final_answer + report evidence"]
+  S7a["7a. Chart Spec<br/>affordances + compiled chart specs"]
+  S7b["7b. Chart Render<br/>stats + charts + plot data"]
+  S7c["7c. Report Assembly<br/>report.md + compliance report"]
+  S8["8. Suggestion Synthesis<br/>domain_pack_suggestions.json"]
 
-    Q --> I --> D --> P --> X --> E
-    E -->|"refine / pivot"| X
-    E -->|"restart"| I
-    E -->|"stop"| F
-    F --> CS --> CR --> R --> S
+  Q --> S1 --> S2 --> S3 --> S4 --> S5 --> Continue
+  Continue -->|"refine / pivot"| S4
+  Continue -->|"stop"| S6
+  Continue -->|"restart"| Restart
+  Restart --> S1
+  S6 --> S7a --> S7b --> S7c --> S8
 ```
 
-### 研究闭环
+### Stage 职责
 
-Deep research loop 由 residual uncertainty 驱动，而不是由“把轮次数用完”驱动。
-
-```mermaid
-stateDiagram-v2
-    [*] --> Audit
-    Audit --> Evaluate: execute round
-    Evaluate --> Refine: progress + residual remains
-    Evaluate --> Pivot: current path weakens
-    Evaluate --> Stop: enough evidence or no better test
-    Evaluate --> Restart: intent frame invalidated
-    Refine --> Evaluate: sharper next contract
-    Pivot --> Evaluate: different hypothesis path
-    Restart --> Audit: new generation
-    Stop --> Finalize
-    Finalize --> Visualize
-    Visualize --> [*]
-```
-
-Hypothesis 状态是显式的：`proposed`、`supported`、`weakened`、`rejected`、`not_tested`、`blocked_by_load`。`not_tested` 是证据状态，不是 runtime 硬阻断；只要最新 evaluation 授权了更好的证据路径，它就可以重新成为目标。`rejected` 默认仍然排除，除非未来设计显式 reopen 能力。
-
----
-
-## 特色机制
-
-| 机制 | 防止的问题 | 实现方式 |
+| Stage | 角色 | 产出 |
 | --- | --- | --- |
-| Stage freeze + 幂等重放 | 下游消费到会移动的上游 artifact。 | 已完成 stage 可重放同 payload；不同 payload 改写冻结 artifact 会被阻断。 |
-| Contract-locked execution | Runtime 替 LLM 发明或修补 SQL。 | Execution 只运行 `InvestigationContract.queries[]`。 |
-| Continuation token | Round 2+ 变成原始 plan 的脚本化展开。 | 新轮次必须引用最新 evaluation、parent round、open question、intent hash 和 plan hash。 |
-| Restart generation tracking | 被推翻的 intent frame 仍产出 final answer。 | Restart 记录 cause history、切换 generation，并阻断旧 frame finalization。 |
-| 统一 rows retention | Preview 泄漏 result rows 已删除字段。 | `rows_preview` 和 `result_rows` 走同一套留存/脱敏策略。 |
-| Ephemeral chart rows | 图表成功率依赖 full rows 落盘。 | 同进程执行可用临时 rows 产图，不把 full rows 写入 artifact。 |
-| Runtime chart materialization | LLM payload 编造图表数值。 | LLM 只给图表语义和字段映射；runtime 从真实 query rows 取值。 |
-| 局部图表降级 | 单个图表失败拖断整份报告。 | 缺数据或字段被 drop 时只 omitted 当前 chart，并记录 warning。 |
-| 开放业务对象分类 | 窄 enum 迫使 LLM 错分业务对象。 | 支持常见 entity type，未知对象可用 `other` 保留原始 label。 |
-| 项目级 eval harness | 修漏洞后流程完成率或质量下降。 | Mock/replay 和可选 live suite 评分完成度、稳定性、安全、lineage 和报告质量。 |
+| 1. Intent Recognition | 将原始问题规范化成安全研究框架。 | `IntentRecognitionResult`、冻结的 `NormalizedIntent`、`pack_gaps`。 |
+| 2. Environment Discovery | 检查 schema 和证据可用性，但不提升业务结论。 | `DataContextBundle`。 |
+| 3. Planning | 构建 hypothesis board，并编写第一轮可执行 contract。 | `PlanBundle`、`round_1_contract`。 |
+| 4. Execution | 只执行显式 `queries[]` 和 `web_searches[]`。 | SQL results、web results、recall assessments、execution log、round bundle。 |
+| 5. Evaluation | 解释已落盘证据，并决定 `refine`、`pivot`、`stop` 或 `restart`。 | `RoundEvaluationResult`，需要继续时产出 continuation token。 |
+| 6. Finalization | 合成 supported claims 和 report evidence。 | `FinalAnswer`、`ReportEvidenceBundle`、`ReportEvidenceIndex`。 |
+| 7a. Chart Spec | Runtime 暴露 chart-ready affordances；LLM 只选择 affordance ids。 | `chart_affordances.json`、`chart_compile_report.json`、`chart_spec_bundle.json`。 |
+| 7b. Chart Render | 基于显式 plot data 和 plot spec 渲染图表。 | `descriptive_stats.json`、`visualization_manifest.json`、`charts/*`。 |
+| 7c. Report Assembly | 组装人类可读 markdown 报告。 | `report.md`、刷新后的 `compliance_report.json`。 |
+| 8. Suggestion Synthesis | session 结束后 best-effort 生成 domain-pack 改进建议。 | 需要时写入 `domain_pack_suggestions.json`。 |
 
----
+## 快速开始
 
-## 图表真实性模型
+Pandora 运行时主体主要依赖 Python 标准库。可选渲染和数仓依赖列在 `requirements.txt`。
 
-图表阶段故意拆成 LLM-authored semantics 和 runtime-owned data materialization。
-
-```mermaid
-sequenceDiagram
-    participant LLM
-    participant Runtime
-    participant Rows as Retained/Ephemeral/Rehydrated Rows
-    participant Chart as Chart Artifact
-
-    LLM->>Runtime: ChartSpec(type, source_query_ref, plot_spec, row selection)
-    Runtime->>Rows: 按 policy 加载 source rows
-    Rows-->>Runtime: 真实 query rows 或 unavailable
-    alt rows available and fields allowed
-        Runtime->>Runtime: 从 source rows 构造 plot data
-        Runtime->>Chart: 渲染 chart + plot-data snapshot
-    else rows unavailable or redacted field missing
-        Runtime->>Chart: Omit chart with warning
-    end
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
-LLM 可以为了兼容性提供 `plot_data.payload`，但其中的数值不参与渲染。如果 payload 与 runtime rows 不一致，runtime 记录 warning，并在 rows 可用时继续用真实 rows 渲染。
+验证本地 runtime 绑定：
 
----
+```bash
+python3 scripts/deep_research_runtime.py doctor
+```
 
-## Artifact 地图
+查看 runtime capabilities：
 
-每个 session 都会在 `RESEARCH/<slug>/sessions/<session_id>/` 下写入显式 artifacts。
+```bash
+python3 scripts/deep_research_runtime.py capabilities
+```
+
+创建 session shell：
+
+```bash
+python3 scripts/deep_research_runtime.py start-session \
+  --slug demo_research \
+  --raw-question "Why did weekly revenue decline?" \
+  --current-date "2026-05-07" \
+  --web-search-mode skip
+```
+
+之后由 host 或 local agent 通过桥接 CLI 逐阶段持久化 artifact：
+
+```bash
+python3 scripts/deep_research_runtime.py persist-intent \
+  --slug demo_research \
+  --session-id <session_id> \
+  --input intent_result.json
+
+python3 scripts/deep_research_runtime.py persist-discovery \
+  --slug demo_research \
+  --session-id <session_id> \
+  --input discovery_bundle.json
+
+python3 scripts/deep_research_runtime.py persist-plan \
+  --slug demo_research \
+  --session-id <session_id> \
+  --input plan_bundle.json
+```
+
+`runtime/session_orchestration.py` 中的 `run_research_session(...)` 是 host integration API。它需要 host 提供 `produce_*` callbacks，不是一个独立的全自动 LLM runner。
+
+## 连接数仓
+
+CLI 只接受已注册 factory alias。这可以避免 LLM-authored content 传入任意 module path 或 filesystem path。
+
+内置 aliases：
+
+| Alias | 实现 |
+| --- | --- |
+| `vendor_http` | `runtime.example_clients.vendor_http_client:create_client` |
+| `http` | `runtime.example_clients.http_sql_client:HttpSqlClient` |
+| `sqlalchemy` | `runtime.example_clients.http_sql_client:SqlAlchemyClient` |
+
+在 host 环境中注册可信自定义 factory：
+
+```bash
+export DEEP_RESEARCH_CLIENT_FACTORIES='{"warehouse":"my_package.clients:create_client"}'
+```
+
+然后通过 alias 执行 discovery 或 contract：
+
+```bash
+python3 scripts/deep_research_runtime.py probe-schema \
+  --client-factory warehouse \
+  --list-tables-sql "SHOW TABLES"
+```
+
+### Vendor HTTP 示例
+
+```bash
+export VENDOR_WAREHOUSE_BASE_URL="https://<warehouse-host>"
+export VENDOR_WAREHOUSE_PATH="/<sql-endpoint>"
+export VENDOR_WAREHOUSE_CHANNEL="<channel-or-app-id>"
+export VENDOR_WAREHOUSE_SECRET="<request-signing-secret>"
+export VENDOR_WAREHOUSE_QUERY_TIMEOUT="60"
+export VENDOR_WAREHOUSE_MAX_ROWS="200000"
+```
+
+## Web Evidence Lane
+
+Pandora 支持 SQL-only session，也支持 SQL/web 混合证据 session。
+
+默认 web provider 是配置后的 Tavily：
+
+```bash
+export TAVILY_API_KEY="<secret>"
+```
+
+常用模式：
+
+| Mode | 行为 |
+| --- | --- |
+| `auto` | 有 provider 时使用；没有时继续 SQL-only。 |
+| `required` | 没有 web provider 时 preflight 失败。 |
+| `skip` | 本次 session 禁用 web search。 |
+
+Host 可以通过 `DEEP_RESEARCH_WEB_CLIENT_FACTORIES` 注册自定义 web client。
+
+## 可视化与报告
+
+Stage 7 是 governed 的，所以图表不能发明新分析。Runtime 先从已落盘证据生成 chart-ready affordances，LLM 选择 affordance ids，然后 runtime 编译并渲染显式 plot data。
+
+```mermaid
+flowchart LR
+  Evidence["已落盘证据"]
+  Affordances["chart_affordances.json"]
+  Plan["LLM affordance plan"]
+  Spec["chart_spec_bundle.json"]
+  Render["charts/*.png<br/>*.plot-data.json"]
+  Report["report.md"]
+
+  Evidence --> Affordances --> Plan --> Spec --> Render --> Report
+```
+
+常用桥接命令：
+
+```bash
+python3 scripts/deep_research_runtime.py prepare-chart-affordances \
+  --slug demo_research \
+  --session-id <session_id>
+
+python3 scripts/deep_research_runtime.py compile-chart-spec \
+  --slug demo_research \
+  --session-id <session_id> \
+  --input chart_affordance_plan.json
+
+python3 scripts/deep_research_runtime.py render-charts \
+  --slug demo_research \
+  --session-id <session_id>
+
+python3 scripts/deep_research_runtime.py assemble-report \
+  --slug demo_research \
+  --session-id <session_id>
+```
+
+Renderer capability 可以通过 `doctor` 或 `capabilities` 查看。当前 runtime 暴露 Matplotlib/Agg renderer，要求显式 plot data，并支持 line、bar、horizontal bar、scatter、area、histogram、box 和 heatmap。
+
+## Artifacts
+
+每个 session 都会将可审计 artifacts 写入：
 
 ```text
 RESEARCH/<slug>/
@@ -223,11 +301,15 @@ RESEARCH/<slug>/
       intent_sidecar.json
       environment_scan.json
       plan.json
-      rounds/<generation_id>/<round_id>.json
+      rounds/
+        <generation_id>/
+          <round_id>.json
       execution_log.json
       final_answer.json
       report_evidence.json
       report_evidence_index.json
+      chart_affordances.json
+      chart_compile_report.json
       chart_spec_bundle.json
       descriptive_stats.json
       visualization_manifest.json
@@ -240,218 +322,82 @@ RESEARCH/<slug>/
       domain_pack_suggestions.json
 ```
 
-核心不变量很简单：**final answer、chart 和 report 是对已落盘证据的包装，不是新增分析的位置。**
-
----
-
-## 竞品形态对比
-
-下面比较的是产品形态，不是具名厂商。分数来自本仓库的架构能力评分模型，不是公开市场 benchmark；如果要评估具体实现，应使用 `scripts/run_project_eval.py` 重新跑分。
-
-评分尺度：
-
-- 0 = 不具备
-- 1 = 弱或主要靠人工
-- 3 = 部分具备
-- 5 = 一等机制
-
-| 能力项 | SQL Chatbot | Notebook Agent | BI Copilot | Workflow Agent | Deep Research Runtime |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 显式 stage protocol | 1 | 2 | 2 | 3 | 5 |
-| 冻结 artifact 纪律 | 0 | 1 | 1 | 3 | 5 |
-| Contract-locked SQL execution | 1 | 2 | 2 | 3 | 5 |
-| 多轮 residual logic | 1 | 2 | 1 | 3 | 5 |
-| Restart 与 stop 区分 | 0 | 1 | 1 | 2 | 5 |
-| Claim-to-query lineage | 1 | 2 | 3 | 3 | 5 |
-| 图表数据真实性约束 | 0 | 1 | 2 | 2 | 5 |
-| Row retention 与 redaction policy | 1 | 1 | 3 | 3 | 5 |
-| 局部降级不阻断流程 | 1 | 2 | 2 | 3 | 5 |
-| 项目级 eval harness | 0 | 1 | 1 | 2 | 5 |
-| **总能力分 / 100** | **12** | **30** | **36** | **54** | **100** |
-
-```mermaid
-xychart-beta
-    title "Architecture Capability Score"
-    x-axis ["SQL Chatbot", "Notebook Agent", "BI Copilot", "Workflow Agent", "Deep Research Runtime"]
-    y-axis "Score / 100" 0 --> 100
-    bar [12, 30, 36, 54, 100]
-```
-
-### 分数如何理解
-
-| 项目形态 | 擅长点 | 常见短板 |
-| --- | --- | --- |
-| SQL Chatbot | 快速单查询探索。 | 闭环弱、lineage 弱，图表容易变成叙事装饰。 |
-| Notebook Agent | 灵活分析和可检查代码单元。 | 状态通常是 notebook-local，不是 protocol-governed。 |
-| BI Copilot | Dashboard 内摘要和指标查询。 | 通常依赖既有语义层，对不确定研究任务支持较弱。 |
-| Workflow Agent | 工具编排和任务自动化。 | 可以串步骤，但不一定强制分析证据纪律。 |
-| Deep Research Runtime | 证据型多轮研究、审计 artifact 和报告交付。 | 需要显式 callbacks、contracts、policies 和 host integration。 |
-
----
-
-## Evaluation Model
-
-项目级 eval harness 不只检查单个漏洞，而是检查完整研究任务能否安全完成并产出有用 artifact。
-
-```mermaid
-flowchart LR
-    Case["Case manifest"]
-    Adapter["Agent adapter\nartifact replay or callback"]
-    Runtime["Runtime session"]
-    Artifacts["Artifacts"]
-    Scorers["Completeness\nSecurity\nQuality\nStability"]
-    Summary["eval_summary.json"]
-
-    Case --> Adapter --> Runtime --> Artifacts --> Scorers --> Summary
-```
-
-默认评分权重：
-
-| 维度 | 权重 |
-| --- | ---: |
-| Protocol compliance | 20 |
-| Intent and scope correctness | 12 |
-| SQL and evidence quality | 18 |
-| Business conclusion accuracy | 22 |
-| Residual and uncertainty discipline | 10 |
-| Lineage and artifact integrity | 10 |
-| Report and visualization usefulness | 8 |
-
-运行 deterministic mock suite：
+上层消费者需要完整持久化上下文时，可以使用 `load_session_evidence(slug)` 或桥接命令：
 
 ```bash
-python3 scripts/run_project_eval.py --suite mock --agent artifact_replay
+python3 scripts/deep_research_runtime.py session-evidence \
+  --slug demo_research \
+  --session-id <session_id>
 ```
-
-可选 live suite 默认关闭，必须显式加 flag 并通过环境变量注入凭据。凭据不能提交到仓库，也不能写入 artifact。
-
-```bash
-python3 scripts/run_project_eval.py \
-  --suite example_retail \
-  --live-example-retail \
-  --agent callback \
-  --case example_retail_audit_004
-```
-
----
-
-## Quick Start
-
-检查 runtime wiring：
-
-```bash
-python3 scripts/deep_research_runtime.py doctor
-```
-
-查看 runtime capabilities：
-
-```bash
-python3 scripts/deep_research_runtime.py capabilities
-```
-
-创建 session root：
-
-```bash
-python3 scripts/deep_research_runtime.py start-session \
-  --slug demo-analysis \
-  --question "Why did the example metric change this month?" \
-  --current-date 2026-05-01
-```
-
-运行编译和 smoke checks：
-
-```bash
-python3 -m py_compile runtime/*.py runtime/example_clients/*.py \
-  scripts/deep_research_runtime.py scripts/run_project_eval.py
-python3 scripts/run_project_eval.py --suite mock --agent artifact_replay
-```
-
-`run_research_session(...)` 是 host integration API，需要外部提供 `produce_*` callbacks；本仓库不内置独立 LLM runner。
-
----
-
-## Host Integration
-
-实现一个 `WarehouseClient`，并通过 factory alias 注册。runtime 接受 alias，不接受 LLM 编写的文件系统路径。
-
-```bash
-export DEEP_RESEARCH_CLIENT_FACTORIES='{"warehouse":"package.module:create_client"}'
-```
-
-示例签名 HTTP client 配置：
-
-```bash
-export VENDOR_WAREHOUSE_BASE_URL="https://<warehouse-host>"
-export VENDOR_WAREHOUSE_PATH="/<sql-endpoint>"
-export VENDOR_WAREHOUSE_CHANNEL="<channel-or-app-id>"
-export VENDOR_WAREHOUSE_SECRET="<request-signing-secret>"
-```
-
-通过 bridge 做 schema probe：
-
-```bash
-python3 scripts/deep_research_runtime.py probe-schema \
-  --client-factory warehouse \
-  --list-tables-sql "SHOW TABLES"
-```
-
----
-
-## Security And Governance
-
-安全是项目级行为，不是最终报告前临时加的一层检查。
-
-| 区域 | Runtime 行为 |
-| --- | --- |
-| SQL execution | 只执行显式 contract queries，并先经过 safety/admission checks。 |
-| Destructive SQL | eval security scan 将其视为 hard failure。 |
-| Credentials | 由 host environment 注入，并在 eval artifacts 中扫描泄漏。 |
-| Row retention | 默认 preview-only，除非 host policy 授权保留。 |
-| Redaction | Preview 和 result rows 共用同一条留存/脱敏路径。 |
-| Charts | 只能来自 retained、ephemeral 或显式 rehydrated runtime rows。 |
-| Restart | 新 valid intent generation 建立前阻断 finalization。 |
-| Frozen artifacts | 同 payload replay 允许，mutation 阻断。 |
-
----
 
 ## Domain Packs
 
-Domain pack 是上下文定制层。它可以调优词汇、problem-type priors、unsupported-dimension hints、operator preferences 和 performance-risk hints。
+Domain pack 是上下文定制层，用于补充词表和先验。它可以调优 metric aliases、dimensions、problem-type hints、hypothesis-family priors、operator preferences 和 performance-risk hints。
 
-它不能：
+它不能替代 discovery，不能向 Stage 1 暴露物理 schema 捷径，也不能取消“可执行 SQL 必须由 LLM 显式编写”这条要求。
 
-- 替代 discovery
-- 给 Stage 1 提供物理 schema 捷径
-- 放宽 SQL safety
-- 绕过 evidence lineage
-- 强迫 LLM 把业务对象归入不准确类别
+从这里开始：
 
-Pack schema 和 consumer matrix 见 [`skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md`](skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md)。
+- `skills/deep-research/domain-packs/DOMAIN_PACK_GUIDE.md`
+- `skills/deep-research/domain-packs/generic/pack.json`
 
----
+## Example SQL 安全说明
+
+仓库包含 Example 数仓边界说明：
+
+- `example_sql_boundary_report.md`
+- `example_sql_writing_rules.md`
+- `skills/deep-research/references/example-sql-rules.md`
+
+当 session 触达 Example 数仓数据时，skill protocol 要求在 probe 或 execute SQL 之前读取 Example SQL rules。
+
+高层规则：
+
+- 只使用单条 `SELECT` 或 `WITH`。
+- 探索样本必须添加 `LIMIT`。
+- 事实表查询要按时间过滤，尤其是 `example_fact.event_time`。
+- 避免无过滤高基数聚合、大排序、堆叠式 `COUNT(DISTINCT ...)`。
+- Join 维表前先过滤或聚合事实表侧。
+
+## 开发
+
+运行测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+常用 smoke checks：
+
+```bash
+python3 scripts/deep_research_runtime.py doctor
+python3 scripts/deep_research_runtime.py capabilities
+```
+
+当前测试覆盖 governed chart affordance 编译、text-only report fallback、web evidence 执行、recall refinement，以及 SQL/web lineage validation。
 
 ## 权威文档
 
-- [`skills/deep-research/SKILL.md`](skills/deep-research/SKILL.md)：用户侧正式协议入口。
-- [`skills/deep-research/references/contracts.md`](skills/deep-research/references/contracts.md)：共享对象唯一事实源。
-- [`skills/deep-research/references/core-methodology.md`](skills/deep-research/references/core-methodology.md)：residual 逻辑、round 策略和 conclusion 纪律。
-- [`skills/intent-recognition/SKILL.md`](skills/intent-recognition/SKILL.md)：Stage 1 intent normalization。
-- [`skills/data-discovery/SKILL.md`](skills/data-discovery/SKILL.md)：Stage 2 environment discovery。
-- [`skills/deep-research/sub-skills/hypothesis-engine.md`](skills/deep-research/sub-skills/hypothesis-engine.md)：Stage 3 planning。
-- [`skills/deep-research/sub-skills/investigation-evaluator.md`](skills/deep-research/sub-skills/investigation-evaluator.md)：Stage 5 evaluation。
-- [`skills/data-visualization/SKILL.md`](skills/data-visualization/SKILL.md)：Stage 7 visualization and reporting。
-
----
+| 文档 | 用途 |
+| --- | --- |
+| `skills/deep-research/SKILL.md` | 用户侧正式协议入口。 |
+| `skills/deep-research/references/contracts.md` | 跨阶段对象唯一事实源。 |
+| `skills/deep-research/references/core-methodology.md` | 五层方法论、residual 逻辑和 conclusion 纪律。 |
+| `skills/intent-recognition/SKILL.md` | Stage 1 intent normalization。 |
+| `skills/data-discovery/SKILL.md` | Stage 2 discovery。 |
+| `skills/deep-research/sub-skills/hypothesis-engine.md` | Stage 3 planning。 |
+| `skills/deep-research/sub-skills/investigation-evaluator.md` | Stage 5 evaluation。 |
+| `skills/data-visualization/SKILL.md` | Stage 7 visualization 和 report packaging。 |
 
 ## 不可违反的规则
 
 1. 完整 session 必须以 `deep-research` 作为入口。
 2. 共享对象 shape 以 `contracts.md` 为唯一事实源。
-3. 下游消费后，上游 artifact 必须冻结。
-4. Discovery 不能混入原因 claim。
+3. Stage 2 开始后冻结 `NormalizedIntent`。
+4. Stage 2 只做 discovery。
 5. Round 1 必须 audit-first。
-6. 只执行显式 `InvestigationContract.queries[]`。
+6. 只执行显式 `InvestigationContract.queries[]` 和 `web_searches[]`。
 7. 只有最新 evaluation 识别出更好的下一步测试时，才能继续。
 8. 矛盾和 residual uncertainty 必须保留。
 9. 每个 supported final claim 都必须追溯到已落盘证据。
-10. Visualization 和 report assembly 只能包装证据，不能新增分析。
+10. 不能用 visualization 或 report assembly 引入新 claim。

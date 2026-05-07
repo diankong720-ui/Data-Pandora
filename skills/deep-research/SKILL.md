@@ -28,7 +28,8 @@ Before taking any stage-local action, load the minimum protocol context:
 
 1. Read `references/contracts.md`.
 2. Read `references/core-methodology.md`.
-3. Read the stage-local internal doc before producing that stage's output.
+3. If the session may query Example data, read `references/example-sql-rules.md`.
+4. Read the stage-local internal doc before producing that stage's output.
 
 Minimum stage-local doc mapping:
 
@@ -41,6 +42,37 @@ Minimum stage-local doc mapping:
 Do not start a stage if you have not loaded the shared contracts and the relevant stage-local rules.
 
 If the required doc cannot be loaded, stop and surface the missing dependency instead of improvising.
+
+### Example SQL Policy
+
+`references/example-sql-rules.md` is mandatory whenever the session touches
+Example warehouse data. This includes any user request that names Example, any
+warehouse/client alias known to represent Example, any `example_*` table, or any SQL
+that targets Example operational tables such as `example_fact`, `example_dimension`,
+`example_entity`, `example_entity_state_history`, `example_entity_metric`, or
+`example_entity_metric_history`.
+
+For Example sessions:
+
+- every discovery probe, `QueryExecutionRequest.sql`, and continuation query
+  must comply with the Example rules before it is persisted or executed
+- only single-statement `SELECT` or `WITH` SQL is allowed
+- exploratory samples must include `LIMIT`, defaulting to `LIMIT 10` and never
+  exceeding `LIMIT 100`
+- fact-table queries, especially `example_fact`, must use an explicit time filter;
+  `example_fact` defaults to `event_time`
+- normal aggregation windows should stay within 7-30 days, exploratory samples
+  within 1-7 days, and trend/low-cost count checks within 90 days unless a
+  smaller validation query has already passed
+- high-risk patterns, including unfiltered high-cardinality aggregation,
+  unfiltered sorting, and stacked `COUNT(DISTINCT ...)`, must be avoided
+- joins must first filter or aggregate the fact side, then join dimension tables
+- every executable query must have an explicit row-return limit when the result
+  can be multi-row
+
+If an Example SQL draft violates these rules, do not execute it and do not rely
+on runtime repair. Revise the contract in the current planning/continuation
+authoring step, or stop at the gate if the stage has already been persisted.
 
 ### Runtime Binding
 
@@ -66,15 +98,24 @@ Use `scripts/deep_research_runtime.py` as the default handoff surface for local
 agents:
 
 - `start-session` creates the session root, `manifest.json`, and
-  `session_state.json`.
-- `capabilities` exposes runtime renderer capabilities and domain packs.
+  `session_state.json`. It also records redacted web search capability state.
+- `capabilities` exposes runtime renderer capabilities, domain packs, and web
+  search configuration status.
 - `persist-intent`, `persist-discovery`, `persist-plan`,
-  `persist-evaluation`, `persist-finalization`, and `persist-chart-spec`
-  validate and persist LLM-authored stage artifacts.
+  `persist-evaluation`, and `persist-finalization` validate and persist
+  LLM-authored stage artifacts.
+- `prepare-chart-affordances` and `compile-chart-spec` are the governed
+  visualization path: runtime prepares chart affordances, and the LLM selects
+  `affordance_id` values in a visualization plan.
+- `persist-chart-spec` is reserved for explicitly trusted legacy
+  `ChartSpecBundle` compatibility imports and requires
+  `--trusted-legacy-chart-spec`.
 - `probe-schema` and `execute-contract` call runtime tools with a registered
   host-supplied `WarehouseClient` factory alias. Do not pass module paths or
   filesystem paths from LLM-authored content; the host must register aliases
   through `DEEP_RESEARCH_CLIENT_FACTORIES`.
+- `execute-contract` can also execute contract-authored `web_searches[]` through
+  a registered web client alias or Tavily when `TAVILY_API_KEY` is configured.
 - `render-charts`, `assemble-report`, `persist-suggestions`, and
   `session-evidence` expose downstream runtime actions.
 
@@ -97,6 +138,7 @@ The runtime may:
 - validate contracts and lineage
 - enforce admission and safety
 - execute explicit SQL
+- execute explicit web search requests
 - persist explicit artifacts
 - record protocol trace and compliance artifacts
 
@@ -105,6 +147,7 @@ The runtime must not:
 - classify the task for you
 - choose tables, joins, filters, or metrics for you
 - rewrite SQL
+- rewrite web search questions or silently add searches
 - repair a weak contract by inference
 - choose whether to continue, pivot, stop, or restart
 - create new business claims on your behalf
@@ -130,10 +173,30 @@ surfaces instead of hardcoded defaults.
   - locale resolution order: explicit manifest locale, report policy locale,
     then raw-question fallback inference
   - default behavior: runtime chooses a locale preset only as fallback
+- web search provider
+  - default recommended provider: Tavily via `TAVILY_API_KEY`
+  - optional environment defaults: `TAVILY_SEARCH_DEPTH`, `TAVILY_MAX_RESULTS`
+  - host may inject a provider-neutral `WebSearchClient`
+  - runtime must persist only redacted capability state, never API keys
 
 Do not author stage outputs to satisfy a specific regex vocabulary or a fixed
 report language. Your outputs must remain contract-valid independent of those
 host policy choices.
+
+### Web Search Capability Preflight
+
+Before the first session stage, inspect web capability status through
+`doctor`, `capabilities`, or `start-session`.
+
+If no web provider is configured, actively surface the options:
+
+- configure Tavily with `TAVILY_API_KEY` and enable the web lane
+- skip web search for this session with `--web-search-mode skip`
+- use a trusted host-injected web provider alias
+
+If the user skips web, continue SQL-only. If a later contract still includes
+`web_searches[]`, runtime will persist those searches as blocked evidence and
+record `web_search_unavailable` in protocol trace.
 
 ---
 
@@ -236,6 +299,8 @@ Allowed actions:
 - interpret discovery findings into the formal `DataContextBundle`
 - record comparison feasibility as capability, not as a result
 - record discovery-time risks and conflicts
+- for Example discovery, use `SHOW TABLES`, successful `DESCRIBE`, or bounded
+  sample probes that follow `references/example-sql-rules.md`
 
 Forbidden actions:
 
@@ -273,9 +338,13 @@ Required inputs:
 Allowed actions:
 
 - generate a falsifiable hypothesis board
+- design evidence lanes for each hypothesis: `warehouse_sql`, `web_search`, or
+  mixed
 - score schema feasibility and relevance
 - author `round_1_contract`
 - record concise planning notes
+- for Example data, author only SQL that passes the checklist in
+  `references/example-sql-rules.md`
 
 Forbidden actions:
 
@@ -283,11 +352,17 @@ Forbidden actions:
 - do not treat the hypothesis board as a fixed execution order
 - do not output semantic query plans that rely on runtime compilation
 - do not use non-audit operators for Round 1
+- do not treat web search as a fallback that only appears after SQL residual is high
 
 Completion gate:
 
 - persist `plan.json`
 - Round 1 must be audit-first and executable
+- if web search is part of Round 1, `round_1_contract.web_searches[]` must be
+  explicit `WebSearchRequest` objects with time/entity/source policy and
+  residual binding
+- any Example `round_1_contract.queries[].sql` must comply with
+  `references/example-sql-rules.md`
 
 Stop conditions:
 
@@ -299,7 +374,7 @@ Stop conditions:
 
 Goal:
 
-- execute only the explicit `InvestigationContract`
+- execute only the explicit `InvestigationContract` evidence lanes
 - persist the round's executable evidence
 
 Required inputs:
@@ -310,22 +385,33 @@ Required inputs:
 
 Allowed actions:
 
-- execute explicit queries in order
+- execute explicit SQL queries
+- execute explicit web search requests
+- execute SQL and initial web search batches in parallel
+- perform same-round web refinement only when a `WebRecallAssessment`
+  authorizes explicit child requests and budget remains
 - use runtime cache and admission behavior as provided
 - record execution metadata and evidence lineage
+- before executing an Example contract, verify the persisted SQL still complies
+  with `references/example-sql-rules.md`
 
 Forbidden actions:
 
 - do not rewrite SQL
 - do not add queries that are not in the contract
+- do not add web searches outside contract-authored or assessment-authorized
+  requests
 - do not mutate the contract during execution
 - do not infer missing joins, filters, or fields at runtime
+- do not treat web provider failure as evidence that a business hypothesis is false
 
 Completion gate:
 
 - persist the round bundle with:
   - `contract`
   - `executed_queries`
+  - `executed_web_searches`
+  - `web_recall_assessments`
   - later `evaluation`
 
 Stop conditions:
@@ -333,6 +419,10 @@ Stop conditions:
 - if Round 1 differs from `PlanBundle.round_1_contract`, stop
 - if Round 2+ lacks valid continuation authorization, stop
 - if execution results do not map to the frozen contract query set, stop
+- if executed initial web searches do not map to the frozen contract web search
+  set, stop
+- if any Example query violates `references/example-sql-rules.md`, stop before
+  execution and return the contract to the authoring gate
 
 ### Stage 5. Evaluation
 
@@ -346,6 +436,8 @@ Required inputs:
 
 - current round contract
 - current round executed query results
+- current round executed web search results
+- current round web recall assessments
 - current hypothesis board / effective hypothesis state
 - prior residual state
 - current warehouse state
@@ -353,25 +445,30 @@ Required inputs:
 Allowed actions:
 
 - update hypothesis states
+- evaluate SQL and web evidence as peer evidence lanes
+- preserve SQL/web contradictions instead of downgrading web recall quality by default
 - rebuild residual state
 - recommend `refine | pivot | stop | restart`
-- emit `continuation_guidance` when continuation is authorized
+- emit `continuation_gsubject_idance` when continuation is authorized
+- for Example 500, 503, timeout, or abnormal latency, authorize only degraded
+  next tests that follow the fallback order in `references/example-sql-rules.md`
 
 Forbidden actions:
 
 - do not recommend continuation because round budget remains
 - do not use failed execution as evidence of falsity
+- do not use web/SQLError disagreement as automatic proof that either source is low quality
 - do not leave open questions vague or decorative
 - do not assume runtime will infer the next contract
 
 Completion gate:
 
 - persist `RoundEvaluationResult`
-- if continuing, the next round must be explicitly authorized through structured continuation guidance
+- if continuing, the next round must be explicitly authorized through structured continuation gsubject_idance
 
 Stop conditions:
 
-- if continuation is chosen without explicit `continuation_guidance`, stop
+- if continuation is chosen without explicit `continuation_gsubject_idance`, stop
 - if `restart` is required, return to intent and do not proceed to finalization
 
 ### Stage 6. Finalization
@@ -390,13 +487,15 @@ Allowed actions:
 
 - produce `FinalAnswer`
 - produce `ReportEvidenceBundle`
-- summarize only already-supported claims
+- summarize only already-supported claims across SQL, web, or mixed lineage
 - keep contradictions and residual uncertainty visible
 
 Forbidden actions:
 
 - do not write `final_answer.json` after restart is required
 - do not introduce unsupported claims
+- do not cite web search in prose unless it has valid `web_refs[]` or evaluation
+  bridge lineage
 - do not hide contradictions to make the narrative cleaner
 - do not use finalization as a second execution or planning stage
 
@@ -410,6 +509,8 @@ Stop conditions:
 
 - if latest evaluation requires restart, stop
 - if supported claims do not have valid lineage, stop
+- every supported claim must include `evidence_channels[]`, explicitly marking
+  `warehouse_sql`, `web_search`, or `mixed`
 
 ### Stage 7. Data Visualization
 
@@ -427,7 +528,8 @@ Required inputs:
 
 Allowed actions:
 
-- produce complete `ChartSpec` objects
+- select runtime-provided chart affordances by `affordance_id`
+- compile selected affordances into complete `ChartSpec` objects
 - render chart assets from persisted evidence
 - assemble `report.md`
 - explain chart omission when evidence is weak or insufficient
@@ -439,6 +541,7 @@ Forbidden actions:
 - do not change `final_answer.json`
 - do not introduce new analytical claims in captions or report prose
 - do not invent missing semantics for an underspecified chart
+- do not infer chart fields or merge datasets across query/schema/grain boundaries
 - do not assume `report.md` always uses Chinese or always uses English
 - do not depend on fixed runtime-owned section titles when preparing chart/report-facing text
 - when chart rendering needs result rows that were lost or purged, prefer
@@ -485,7 +588,7 @@ Completion gate:
 
 ---
 
-## Producer Guidance
+## Producer Gsubject_idance
 
 If an external orchestrator implements producer functions, those producers must obey the protocol.
 
@@ -501,10 +604,11 @@ Treat evaluation as a closure-and-authorization step.
 
 It must:
 
-- use only the current round's executed evidence
+- use only the current round's executed SQL evidence, web evidence, and web recall assessments
 - rebuild residual state explicitly
+- evaluate support, contradiction, and mixed SQL/web bridge strength explicitly
 - decide `refine | pivot | stop | restart`
-- emit `continuation_guidance` whenever `should_continue = true`
+- emit `continuation_gsubject_idance` whenever `should_continue = true`
 - explain why another full round is still worthwhile
 - name which paths are no longer worth pursuing
 
@@ -513,6 +617,7 @@ It must not:
 - continue only because `max_rounds` remains
 - emit vague open questions
 - authorize continuation without a narrower next test
+- discard high-authority web evidence solely because it conflicts with SQL; record the contradiction instead
 
 ### `produce_next_contract(...)`
 
@@ -521,14 +626,18 @@ Treat `plan_bundle` as background only.
 
 It must:
 
-- start from `latest_evaluation.continuation_guidance`
+- start from `latest_evaluation.continuation_gsubject_idance`
 - bind the next round to prioritized open questions and the target residual component
+- choose SQL, web, or mixed evidence lanes based on the hypothesis and expected signal, not on whether SQL residual is already high
 - include `material_change_reason` with changed axes, why the change is material,
   how it can reduce residual uncertainty, and why it is not repeating the parent round
 - avoid exact parent-contract replay
 - for `refine`, sharpen the query set toward the authorized residual or open question
 - for `pivot`, change `operator_id` or `target_hypotheses` in substance
 - map each query to an authorized open question or residual component
+- map each web search to an authorized open question or residual component
+- for Example data, apply `references/example-sql-rules.md` to every new query
+  and prefer fallback-safe rewrites after timeout or 500/503 failures
 
 It must not:
 
@@ -536,6 +645,7 @@ It must not:
 - replay the parent round with near-duplicate queries
 - emit `pivot` without a substantive operator or target change
 - emit `refine` without query-level sharpening
+- emit web refinement without `parent_search_id`, `recall_gap`, `changed_axes`, and `expected_new_signal`
 
 ---
 
@@ -571,6 +681,12 @@ RESEARCH/<slug>/
 
 Do not write extra artifacts that are not backed by explicit LLM output or runtime facts.
 
+Round bundles may now contain:
+
+- `executed_queries`
+- `executed_web_searches`
+- `web_recall_assessments`
+
 ---
 
 ## Common Violation Patterns
@@ -582,6 +698,7 @@ Treat the following as protocol violations:
 - using Stage 2 discovery to start root cause analysis
 - using Stage 3 planning to script Round 2+ in advance
 - changing the contract during execution
+- letting web search run outside `InvestigationContract.web_searches[]` or assessment-authorized refinement
 - continuing because budget remains instead of because a better next test exists
 - writing `final_answer.json` after `restart_required`
 - using visualization or report assembly to introduce new claims
@@ -600,3 +717,4 @@ If you detect one of these patterns in your own draft output, stop and correct i
 - Keep cached evidence explicitly labeled.
 - Keep runtime blocking facts explicit when `blocked_runtime` is the final state.
 - If a gate condition fails, stop at that stage rather than improvising a recovery path.
+- For every Example data query, follow `references/example-sql-rules.md`.

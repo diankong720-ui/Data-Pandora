@@ -101,7 +101,7 @@ class VendorHttpConfig:
 
 
 class VendorHttpWarehouseClient(WarehouseClient):
-    """Adapter from a signed HTTP SQL API to the runtime WarehouseClient."""
+    """Adapter from a signed HTTP SQL API to the runtime's WarehouseClient."""
 
     def __init__(self, config: VendorHttpConfig | None = None) -> None:
         self.config = config or VendorHttpConfig.from_env()
@@ -154,7 +154,7 @@ class VendorHttpWarehouseClient(WarehouseClient):
         timeout: float = 30.0,
         max_rows: int = 10_000,
     ) -> QueryResult:
-        output_name = "query_result"
+        output_name = "example_result"
         try:
             payload = self._post_sqls(
                 {output_name: sql},

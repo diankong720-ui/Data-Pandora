@@ -106,6 +106,10 @@ DEFAULT_CLIENT_FACTORY_REGISTRY = {
     "sqlalchemy": "runtime.example_clients.http_sql_client:SqlAlchemyClient",
 }
 
+DEFAULT_WEB_CLIENT_FACTORY_REGISTRY = {
+    "tavily": "runtime.web_search:TavilySearchClient",
+}
+
 
 def _load_client_factory_registry() -> dict[str, str]:
     registry = dict(DEFAULT_CLIENT_FACTORY_REGISTRY)
@@ -122,6 +126,25 @@ def _load_client_factory_registry() -> dict[str, str]:
                 raise ValueError("Client factory aliases must be non-empty strings.")
             if not isinstance(spec, str) or not spec.strip():
                 raise ValueError(f"Client factory spec for alias {alias!r} must be a non-empty string.")
+            registry[alias.strip()] = spec.strip()
+    return registry
+
+
+def _load_web_client_factory_registry() -> dict[str, str]:
+    registry = dict(DEFAULT_WEB_CLIENT_FACTORY_REGISTRY)
+    raw_registry = os.getenv("DEEP_RESEARCH_WEB_CLIENT_FACTORIES")
+    if raw_registry:
+        try:
+            configured = json.loads(raw_registry)
+        except json.JSONDecodeError as exc:
+            raise ValueError("DEEP_RESEARCH_WEB_CLIENT_FACTORIES must be a JSON object.") from exc
+        if not isinstance(configured, dict):
+            raise ValueError("DEEP_RESEARCH_WEB_CLIENT_FACTORIES must be a JSON object.")
+        for alias, spec in configured.items():
+            if not isinstance(alias, str) or not alias.strip():
+                raise ValueError("Web client factory aliases must be non-empty strings.")
+            if not isinstance(spec, str) or not spec.strip():
+                raise ValueError(f"Web client factory spec for alias {alias!r} must be a non-empty string.")
             registry[alias.strip()] = spec.strip()
     return registry
 
@@ -155,6 +178,20 @@ def _resolve_factory(alias: str) -> Any:
     return _load_factory_from_spec(spec)
 
 
+def _resolve_web_factory(alias: str) -> Any:
+    if ":" in alias or "/" in alias or "\\" in alias or alias.endswith(".py"):
+        raise ValueError(
+            "Web client factory must be a registered alias, not a module path. "
+            "Set DEEP_RESEARCH_WEB_CLIENT_FACTORIES='{\"alias\":\"module.path:factory\"}' in the trusted host environment."
+        )
+    registry = _load_web_client_factory_registry()
+    spec = registry.get(alias)
+    if spec is None:
+        available = ", ".join(sorted(registry)) or "<none>"
+        raise ValueError(f"Unknown web client factory alias {alias!r}. Available aliases: {available}.")
+    return _load_factory_from_spec(spec)
+
+
 def cmd_doctor(_args: argparse.Namespace) -> None:
     runtime = _load_runtime()
     _emit(
@@ -170,6 +207,7 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
             "runtime_import_ok": True,
             "runtime_has_run_research_session": hasattr(runtime, "run_research_session"),
             "visualization_capabilities": runtime.get_visualization_capabilities(),
+            "web_search": runtime.get_web_search_configuration_status(),
         }
     )
 
@@ -180,6 +218,7 @@ def cmd_capabilities(_args: argparse.Namespace) -> None:
         {
             "visualization": runtime.get_visualization_capabilities(),
             "available_domain_packs": runtime.load_available_domain_packs(),
+            "web_search": runtime.get_web_search_configuration_status(),
         }
     )
 
@@ -190,6 +229,10 @@ def cmd_start_session(args: argparse.Namespace) -> None:
     from runtime.session_state import initialize_session_state
 
     runtime_policy = _policy_from_args(args)
+    web_status = runtime.get_web_search_configuration_status(mode=args.web_search_mode)
+    if args.web_search_mode == "required" and not web_status.get("configured"):
+        raise ValueError("Web search mode is required but no provider is configured. Set TAVILY_API_KEY or use a host web provider.")
+    runtime_policy.setdefault("web_search", web_status)
     semantic_guard_policy = runtime_policy.get("semantic_guard_policy")
     if isinstance(semantic_guard_policy, dict):
         runtime.configure_semantic_guard_policy(semantic_guard_policy)
@@ -272,15 +315,23 @@ def cmd_execute_contract(args: argparse.Namespace) -> None:
     runtime = _load_runtime()
     _configure_runtime_policy(runtime, args)
     client = _resolve_factory(args.client_factory)
+    web_client = (
+        _resolve_web_factory(args.web_client_factory)
+        if args.web_client_factory
+        else runtime.resolve_default_web_client(mode=args.web_search_mode)
+    )
     bundle = runtime.persist_round_execution_stage(
         client,
         args.slug,
         _read_json(args.contract),
+        web_client=web_client,
         session_mode=runtime.SESSION_MODE_ORCHESTRATED_ONLY,
         session_id=args.session_id,
         timeout=args.timeout,
         max_rows=args.max_rows,
         max_cache_age_seconds=args.max_cache_age_seconds,
+        web_timeout=args.web_timeout,
+        web_max_results=args.web_max_results,
     )
     _emit({"status": "ok", "bundle": bundle})
 
@@ -311,6 +362,12 @@ def cmd_persist_finalization(args: argparse.Namespace) -> None:
 
 
 def cmd_persist_chart_spec(args: argparse.Namespace) -> None:
+    if not args.trusted_legacy_chart_spec:
+        raise SystemExit(
+            "persist-chart-spec is reserved for trusted legacy ChartSpecBundle inputs. "
+            "Use prepare-chart-affordances and compile-chart-spec for LLM-authored visualization plans, "
+            "or pass --trusted-legacy-chart-spec for a non-governed compatibility import."
+        )
     runtime = _load_runtime()
     _configure_runtime_policy(runtime, args)
     path = runtime.persist_chart_spec_stage(
@@ -331,6 +388,53 @@ def cmd_persist_chart_spec(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_prepare_chart_affordances(args: argparse.Namespace) -> None:
+    runtime = _load_runtime()
+    _configure_runtime_policy(runtime, args)
+    bundle = runtime.persist_chart_affordance_bundle(args.slug, session_id=args.session_id)
+    _emit({"status": "ok", "bundle": bundle})
+
+
+def cmd_compile_chart_spec(args: argparse.Namespace) -> None:
+    runtime = _load_runtime()
+    _configure_runtime_policy(runtime, args)
+    chart_affordance_bundle = runtime.read_artifact(
+        args.slug,
+        "chart_affordances.json",
+        session_id=args.session_id,
+        strict_session=True,
+    )
+    if not isinstance(chart_affordance_bundle, dict):
+        chart_affordance_bundle = runtime.persist_chart_affordance_bundle(args.slug, session_id=args.session_id)[
+            "chart_affordances"
+        ]
+    compiled = runtime.compile_chart_specs_from_affordance_plan(
+        _read_json(args.input),
+        chart_affordance_bundle,
+    )
+    compile_report_path = runtime.persist_artifact(
+        args.slug,
+        "chart_compile_report.json",
+        compiled["chart_compile_report"],
+        session_id=args.session_id,
+        strict_session=True,
+    )
+    chart_spec_path = runtime.persist_chart_spec_stage(
+        args.slug,
+        compiled["chart_spec_bundle"],
+        session_mode=runtime.SESSION_MODE_ORCHESTRATED_ONLY,
+        session_id=args.session_id,
+    )
+    _emit(
+        {
+            "status": "ok",
+            "chart_spec_path": chart_spec_path,
+            "chart_compile_report_path": compile_report_path,
+            "chart_compile_report": compiled["chart_compile_report"],
+        }
+    )
+
+
 def cmd_render_charts(args: argparse.Namespace) -> None:
     runtime = _load_runtime()
     _configure_runtime_policy(runtime, args)
@@ -341,7 +445,6 @@ def cmd_render_charts(args: argparse.Namespace) -> None:
         session_mode=runtime.SESSION_MODE_ORCHESTRATED_ONLY,
         session_id=args.session_id,
         rehydrate_missing_result_rows=args.rehydrate_missing_result_rows,
-        temporary_visualization_rows_max=args.temporary_visualization_rows_max,
         timeout=args.timeout,
         max_rows=args.max_rows,
         max_cache_age_seconds=args.max_cache_age_seconds,
@@ -404,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--runtime-policy")
     start.add_argument("--report-policy")
     start.add_argument("--semantic-guard-policy")
+    start.add_argument("--web-search-mode", choices=["auto", "skip", "required"], default="auto")
     start.set_defaults(func=cmd_start_session)
 
     persist_intent = subparsers.add_parser("persist-intent", help="Persist an IntentRecognitionResult JSON file.")
@@ -432,9 +536,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_session_args(execute_contract)
     execute_contract.add_argument("--contract", required=True)
     execute_contract.add_argument("--client-factory", required=True)
+    execute_contract.add_argument("--web-client-factory")
+    execute_contract.add_argument("--web-search-mode", choices=["auto", "skip", "required"], default="auto")
     execute_contract.add_argument("--timeout", type=float, default=30.0)
     execute_contract.add_argument("--max-rows", type=int, default=10_000)
     execute_contract.add_argument("--max-cache-age-seconds", type=float)
+    execute_contract.add_argument("--web-timeout", type=float, default=30.0)
+    execute_contract.add_argument("--web-max-results", type=_positive_int)
     execute_contract.set_defaults(func=cmd_execute_contract)
 
     persist_evaluation = subparsers.add_parser("persist-evaluation", help="Persist a RoundEvaluationResult JSON file.")
@@ -448,16 +556,34 @@ def build_parser() -> argparse.ArgumentParser:
     persist_finalization.add_argument("--report-evidence", required=True)
     persist_finalization.set_defaults(func=cmd_persist_finalization)
 
-    persist_chart_spec = subparsers.add_parser("persist-chart-spec", help="Persist a ChartSpecBundle JSON file.")
+    persist_chart_spec = subparsers.add_parser(
+        "persist-chart-spec",
+        help="Persist a trusted legacy ChartSpecBundle JSON file outside governed LLM chart planning.",
+    )
     _add_session_args(persist_chart_spec)
     persist_chart_spec.add_argument("--input", required=True)
+    persist_chart_spec.add_argument("--trusted-legacy-chart-spec", action="store_true")
     persist_chart_spec.set_defaults(func=cmd_persist_chart_spec)
+
+    prepare_chart_affordances = subparsers.add_parser(
+        "prepare-chart-affordances",
+        help="Build and persist runtime-owned chart-ready dataset affordances.",
+    )
+    _add_session_args(prepare_chart_affordances)
+    prepare_chart_affordances.set_defaults(func=cmd_prepare_chart_affordances)
+
+    compile_chart_spec = subparsers.add_parser(
+        "compile-chart-spec",
+        help="Compile an affordance-selection visualization plan into a ChartSpecBundle.",
+    )
+    _add_session_args(compile_chart_spec)
+    compile_chart_spec.add_argument("--input", required=True)
+    compile_chart_spec.set_defaults(func=cmd_compile_chart_spec)
 
     render_charts = subparsers.add_parser("render-charts", help="Render chart artifacts from chart_spec_bundle.json.")
     _add_session_args(render_charts)
     render_charts.add_argument("--client-factory")
     render_charts.add_argument("--rehydrate-missing-result-rows", action="store_true")
-    render_charts.add_argument("--temporary-visualization-rows-max", type=_positive_int)
     render_charts.add_argument("--timeout", type=float, default=30.0)
     render_charts.add_argument("--max-rows", type=_positive_int, default=10_000)
     render_charts.add_argument("--max-cache-age-seconds", type=float)

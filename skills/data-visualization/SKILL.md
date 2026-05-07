@@ -13,6 +13,8 @@ Its job is to turn already-persisted research evidence into a readable
 artifact bundle for humans:
 
 - `report_evidence.json`
+- `chart_affordances.json`
+- `chart_compile_report.json`
 - `chart_spec_bundle.json`
 - `descriptive_stats.json`
 - `visualization_manifest.json`
@@ -34,12 +36,14 @@ It is a reporting stage, not a research stage.
 
 ## Responsibilities
 
-- validate structured chart specs authored by the LLM
+- normalize persisted evidence into runtime-owned homogeneous chart-ready datasets
+- expose only runtime-supported chart affordances to the LLM
+- compile LLM-selected affordance plans into structured chart specs
 - consume only already-executed and already-persisted session evidence
 - when explicitly requested through the runtime bridge, let runtime rehydrate
   missing chart source rows from cache or by re-executing only the original
   chart-referenced contract query
-- render the LLM-authored high-level `plot_spec` directly, without inferring chart type, field roles, or transform intent
+- render compiled `plot_spec` directly, without inferring chart type, field roles, or transform intent
 - generate descriptive statistics summaries
 - generate chart files, plot-data snapshots, and captions
 - persist chart lineage back to the originating `query_refs` and `evidence_refs`
@@ -53,6 +57,7 @@ It is a reporting stage, not a research stage.
 - do not create conclusions beyond the already-persisted final answer and report evidence
 - do not force chart output when evidence is weak or irrelevant
 - do not guess business semantics, chart type, field roles, or transform logic when a chart spec is under-specified
+- do not let the LLM merge rows from different query/schema/grain groups into one chart dataset
 
 ## Runtime Row Rehydration
 
@@ -70,6 +75,30 @@ This does not authorize new analysis. Runtime may only restore rows for
 `chart_spec_bundle.specs[*].source_query_ref` from cache or from the original
 frozen contract query. If restoration fails, runtime records the omission in
 `descriptive_stats.json` and continues report delivery.
+
+## Chartable Dataset Rules
+
+Runtime treats any LLM-authored visualization candidate as untrusted semantic
+input. The chartable unit is a homogeneous dataset:
+
+- rows must come from one `query_ref`
+- rows must share one schema signature and one set of guaranteed fields
+- summary, trend, distribution, and reconciliation-shaped rows must not be mixed
+- single-row KPI/reconciliation summaries are marked `not_chartable` unless a
+  future renderer explicitly supports KPI cards
+
+Runtime persists `chart_affordances.json` with:
+
+- `datasets[].columns`
+- `datasets[].guaranteed_fields`
+- `datasets[].dimension_fields`
+- `datasets[].measure_fields`
+- `datasets[].grain`
+- `datasets[].semantic_role`
+- `datasets[].row_count`
+- `datasets[].null_rates`
+- `datasets[].eligible_chart_types`
+- `chart_affordances[]`
 
 ## Chart Admission Rules
 
@@ -97,8 +126,8 @@ When these conditions are not met:
 Notes:
 
 - these are defaults, not exclusive targets
-- the LLM should prefer emitting a complete `ChartSpec` over a vague chart suggestion
-- `semantic_chart_type` is a free-form semantic label owned by the LLM
+- the LLM should prefer selecting a concrete `affordance_id` over naming a vague chart suggestion
+- `semantic_chart_type` is report-facing metadata and may be copied from the selected plan
 - `renderer_hint` is optional free-form provenance, not a runtime enum
 - runtime renders high-level `plot_spec` instructions through matplotlib
 - runtime capabilities are declared by `get_visualization_capabilities()`
@@ -107,9 +136,28 @@ Notes:
 - additional supported chart types are:
   `area`, `histogram`, `box`, `heatmap`
 
+## Visualization Plan Guidance
+
+Default target: choose from runtime-provided affordances.
+
+The LLM should author a visualization plan whose chart entries select:
+
+- `affordance_id`
+- `title`
+- `caption`
+- `narrative_role`
+- `report_section`
+- `why_this_chart`
+
+Do not provide or override `x_field`, `y_field`, `series_field`, row filters,
+or fused datasets. Runtime compiles the selected affordance into a complete
+`ChartSpecBundle`.
+
 ## Chart Spec Guidance
 
-Default target: make every spec directly renderable.
+Legacy direct `ChartSpecBundle` inputs are trusted compatibility artifacts only.
+LLM producers must not author them in the governed chart path. Use
+runtime-provided affordance plans instead; runtime-compiled specs provide:
 
 Each chart spec should explicitly provide:
 

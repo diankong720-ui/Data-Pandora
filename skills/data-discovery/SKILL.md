@@ -87,6 +87,15 @@ Typical actions:
 - inspect sample rows
 - record current warehouse load and admission state
 
+Example-specific discovery:
+
+- read `skills/deep-research/references/example-sql-rules.md` before probing Example data
+- use `SHOW TABLES` to discover visible tables when available
+- `DESCRIBE` may be used for tables where it succeeds, but do not repeatedly retry `DESCRIBE` after a 500
+- fallback schema probes must be bounded samples such as `SELECT * FROM <table> LIMIT 1` or `LIMIT 10`
+- fact-table samples, especially `example_fact`, must use a small time window when a safe time field is known
+- never use discovery to run unbounded `example_fact` scans, high-cardinality aggregation, or stacked distinct queries
+
 ### 2. Interpret discovery findings
 
 The LLM maps raw findings into the shared `DataContextBundle` fields.
@@ -143,6 +152,7 @@ This stage does not consume:
 
 - Follow the shared contracts in `contracts.md`.
 - Keep Stage 2 discovery-only.
+- Apply the Example SQL rules to all Example schema and sample probes.
 - Do not place verification outcomes such as `headline_verified` or metric deltas in `DataContextBundle`.
 - Do not assume downstream code will infer schema semantics from raw probes.
 - Do not emit executable investigation SQL from this stage.

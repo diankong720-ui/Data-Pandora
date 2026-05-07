@@ -19,6 +19,7 @@ PROTOCOL_GATE_ENFORCEMENT: dict[str, str] = {
     "plan.no_future_script": "observe",
     "execution.contract_immutable": "strict",
     "execution.query_membership": "strict",
+    "execution.web_search_membership": "strict",
     "evaluation.open_question_materiality": "observe",
     "finalization.claim_overreach": "observe",
     "visualization.reference_integrity": "strict",
@@ -338,6 +339,7 @@ def validate_execution_stage_payload(
     contract: dict[str, Any],
     executed_queries: list[dict[str, Any]],
     *,
+    executed_web_searches: list[dict[str, Any]] | None = None,
     expected_contract_hash: str,
     session_id: str | None = None,
 ) -> None:
@@ -360,6 +362,22 @@ def validate_execution_stage_payload(
             gate_id="execution.query_membership",
             severity="strict_violation",
             message="Executed query ids do not match the frozen InvestigationContract query set.",
+            refs=[str(contract.get("contract_id") or "contract")],
+            session_id=session_id,
+            exception_type=LineageIntegrityViolation,
+        )
+    expected_search_ids = [str(search.get("search_id")) for search in contract.get("web_searches", []) if isinstance(search, dict)]
+    actual_search_ids = [
+        str(search.get("search_id"))
+        for search in executed_web_searches or []
+        if isinstance(search, dict)
+    ]
+    if expected_search_ids and actual_search_ids[: len(expected_search_ids)] != expected_search_ids:
+        _record_gate(
+            slug,
+            gate_id="execution.web_search_membership",
+            severity="strict_violation",
+            message="Executed web search ids do not begin with the frozen InvestigationContract web_searches set.",
             refs=[str(contract.get("contract_id") or "contract")],
             session_id=session_id,
             exception_type=LineageIntegrityViolation,
@@ -403,6 +421,7 @@ def validate_finalization_stage_payload(
 ) -> None:
     entries = report_evidence.get("entries", []) if isinstance(report_evidence, dict) else []
     evidence_text_by_query_ref: dict[tuple[str, str], list[str]] = {}
+    evidence_text_by_web_ref: dict[tuple[str, str], list[str]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -416,6 +435,13 @@ def validate_finalization_stage_payload(
             query_id = query_ref.get("query_id")
             if isinstance(round_id, str) and isinstance(query_id, str):
                 evidence_text_by_query_ref.setdefault((round_id, query_id), []).append(text)
+        for web_ref in entry.get("web_refs", []):
+            if not isinstance(web_ref, dict):
+                continue
+            round_id = web_ref.get("round_id")
+            search_id = web_ref.get("search_id")
+            if isinstance(round_id, str) and isinstance(search_id, str):
+                evidence_text_by_web_ref.setdefault((round_id, search_id), []).append(text)
 
     semantic_claim_patterns = _SEMANTIC_GUARD_PATTERNS.get("finalization.claim_overreach", [])
     if not semantic_claim_patterns:
@@ -431,10 +457,18 @@ def validate_finalization_stage_payload(
         ):
             continue
         linked_text = " ".join(
-            text
-            for query_ref in claim.get("query_refs", [])
-            if isinstance(query_ref, dict)
-            for text in evidence_text_by_query_ref.get((query_ref.get("round_id"), query_ref.get("query_id")), [])
+            [
+                text
+                for query_ref in claim.get("query_refs", [])
+                if isinstance(query_ref, dict)
+                for text in evidence_text_by_query_ref.get((query_ref.get("round_id"), query_ref.get("query_id")), [])
+            ]
+            + [
+                text
+                for web_ref in claim.get("web_refs", [])
+                if isinstance(web_ref, dict)
+                for text in evidence_text_by_web_ref.get((web_ref.get("round_id"), web_ref.get("search_id")), [])
+            ]
         )
         if linked_text and not any(
             pattern.search(linked_text) for pattern in semantic_claim_patterns

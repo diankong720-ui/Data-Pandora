@@ -20,16 +20,11 @@ FINAL_ANSWER_REQUIRED_FIELDS = (
 )
 
 
-def get_latest_round_evaluation(
-    slug: str,
-    *,
-    session_id: str | None = None,
-    generation_id: str | None = None,
-) -> dict[str, Any] | None:
+def get_latest_round_evaluation(slug: str, *, session_id: str | None = None) -> dict[str, Any] | None:
     """Return the latest persisted RoundEvaluationResult based on round_number."""
     latest: dict[str, Any] | None = None
     latest_round_number = -1
-    active_generation_id = generation_id or get_active_generation_id(
+    active_generation_id = get_active_generation_id(
         slug,
         session_id=session_id,
         strict_session=bool(session_id),
@@ -57,6 +52,7 @@ def _validate_supported_claim_lineage(
     session_id: str | None = None,
 ) -> None:
     known_query_refs: set[tuple[str, str]] = set()
+    known_web_refs: set[tuple[str, str]] = set()
     known_evaluation_refs: set[str] = set()
     active_generation_id = get_active_generation_id(
         slug,
@@ -77,6 +73,10 @@ def _validate_supported_claim_lineage(
             query_id = query.get("query_id")
             if isinstance(round_id, str) and isinstance(query_id, str):
                 known_query_refs.add((round_id, query_id))
+        for search in bundle.get("executed_web_searches", []):
+            search_id = search.get("search_id")
+            if isinstance(round_id, str) and isinstance(search_id, str):
+                known_web_refs.add((round_id, search_id))
 
     for claim in supported_claims:
         if not isinstance(claim, dict):
@@ -84,11 +84,19 @@ def _validate_supported_claim_lineage(
         if not isinstance(claim.get("claim"), str) or not claim["claim"]:
             raise ValueError("Each FinalAnswer.supported_claim must include a non-empty claim field.")
         query_refs = claim.get("query_refs", [])
+        web_refs = claim.get("web_refs", [])
         evaluation_refs = claim.get("evaluation_refs", [])
-        if not isinstance(query_refs, list) or not isinstance(evaluation_refs, list):
+        if not isinstance(query_refs, list) or not isinstance(web_refs, list) or not isinstance(evaluation_refs, list):
             raise ValueError("FinalAnswer supported-claim lineage fields must be arrays.")
-        if not query_refs and not evaluation_refs:
-            raise ValueError("Each FinalAnswer.supported_claim must include query_refs or evaluation_refs.")
+        if not query_refs and not web_refs and not evaluation_refs:
+            raise ValueError("Each FinalAnswer.supported_claim must include query_refs, web_refs, or evaluation_refs.")
+        channels = claim.get("evidence_channels")
+        if not isinstance(channels, list) or not channels:
+            raise ValueError("Each FinalAnswer.supported_claim must include evidence_channels.")
+        legal_channels = {"warehouse_sql", "web_search", "mixed"}
+        for channel in channels:
+            if channel not in legal_channels:
+                raise ValueError("FinalAnswer.evidence_channels contains an unsupported channel.")
         for query_ref in query_refs:
             if not isinstance(query_ref, dict):
                 raise ValueError("FinalAnswer.query_refs entries must be objects.")
@@ -100,6 +108,24 @@ def _validate_supported_claim_lineage(
                 raise ValueError(
                     f"FinalAnswer supported claim references unknown query lineage: {round_id}:{query_id}."
                 )
+        for web_ref in web_refs:
+            if not isinstance(web_ref, dict):
+                raise ValueError("FinalAnswer.web_refs entries must be objects.")
+            round_id = web_ref.get("round_id")
+            search_id = web_ref.get("search_id")
+            if not isinstance(round_id, str) or not isinstance(search_id, str):
+                raise ValueError("FinalAnswer.web_refs entries must include round_id and search_id.")
+            if (round_id, search_id) not in known_web_refs:
+                raise ValueError(
+                    f"FinalAnswer supported claim references unknown web lineage: {round_id}:{search_id}."
+                )
+        channel_set = set(channels)
+        if query_refs and web_refs and not ({"warehouse_sql", "web_search"} <= channel_set or "mixed" in channel_set):
+            raise ValueError("FinalAnswer mixed SQL/web claims must mark evidence_channels as mixed or include both lanes.")
+        if query_refs and not web_refs and "warehouse_sql" not in channel_set:
+            raise ValueError("FinalAnswer SQL-only claims must include warehouse_sql in evidence_channels.")
+        if web_refs and not query_refs and "web_search" not in channel_set:
+            raise ValueError("FinalAnswer web-only claims must include web_search in evidence_channels.")
         for evaluation_ref in evaluation_refs:
             if not isinstance(evaluation_ref, str) or not evaluation_ref:
                 raise ValueError("FinalAnswer.evaluation_refs entries must be non-empty strings.")
@@ -124,6 +150,15 @@ def _validate_contradictions(contradictions: Any) -> None:
             raise ValueError(
                 "FinalAnswer.contradictions object entries must include non-empty text, claim, or summary."
             )
+        if "web_refs" in contradiction:
+            web_refs = contradiction["web_refs"]
+            if not isinstance(web_refs, list):
+                raise ValueError("FinalAnswer.contradictions.web_refs must be a list when provided.")
+            for web_ref in web_refs:
+                if not isinstance(web_ref, dict):
+                    raise ValueError("FinalAnswer.contradictions.web_refs entries must be objects.")
+                if not isinstance(web_ref.get("round_id"), str) or not isinstance(web_ref.get("search_id"), str):
+                    raise ValueError("FinalAnswer.contradictions.web_refs entries must include round_id and search_id.")
 
 
 def _require_non_empty_string(value: Any, *, label: str) -> None:

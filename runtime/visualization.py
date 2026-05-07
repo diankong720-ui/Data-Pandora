@@ -18,7 +18,6 @@ from runtime.contracts import (
     validate_visualization_manifest,
 )
 from runtime.cache import load_cached_rows
-from runtime.ephemeral_rows import clear_ephemeral_result_rows, get_ephemeral_result_rows
 from runtime.persistence import (
     get_session_context,
     load_session_evidence,
@@ -31,7 +30,6 @@ from runtime.tools import apply_result_row_retention, execute_query_request
 from runtime.visualization_capabilities import RENDER_ENGINE_ID, SUPPORTED_CHART_TYPES
 
 USABLE_QUERY_STATUSES = {"success", "cached", "degraded_to_cache"}
-MAX_CHART_RENDER_ROWS = 5_000
 REPORT_TEMPLATE_PRESETS: dict[str, dict[str, str]] = {
     "zh-CN": {
         "title": "数据分析报告",
@@ -244,28 +242,577 @@ def _safe_artifact_name_component(value: str, *, fallback: str) -> str:
     return safe or fallback
 
 
-def _plot_item_source_indexes(items: list[dict[str, Any]], source_rows: list[dict[str, Any]]) -> list[int]:
-    if not source_rows:
-        raise ValueError("source query result rows are empty; chart rendering requires at least one row.")
-    max_index = len(source_rows) - 1
-    source_indexes: list[int] = []
-    for item in items:
-        if not isinstance(item, dict):
+def _schema_signature(columns: list[str]) -> str:
+    return stable_payload_hash({"columns": columns})
+
+
+def _is_time_dimension_field(field_name: str) -> bool:
+    normalized = field_name.lower()
+    return any(token in normalized for token in ("week", "date", "day", "month", "quarter", "year"))
+
+
+def _classify_fields(rows: list[dict[str, Any]], columns: list[str]) -> tuple[list[str], list[str], dict[str, float]]:
+    null_rates: dict[str, float] = {}
+    measure_fields: list[str] = []
+    dimension_fields: list[str] = []
+    row_count = len(rows)
+    for column in columns:
+        values = [row.get(column) for row in rows]
+        null_count = sum(1 for value in values if value is None)
+        null_rates[column] = null_count / row_count if row_count else 0.0
+        non_null_values = [value for value in values if value is not None]
+        numeric_values = [_coerce_float(value) for value in non_null_values]
+        if non_null_values and all(value is not None for value in numeric_values):
+            measure_fields.append(column)
+        else:
+            dimension_fields.append(column)
+    return dimension_fields, measure_fields, null_rates
+
+
+def _infer_dataset_grain(columns: list[str], dimension_fields: list[str]) -> str:
+    for field_name in dimension_fields:
+        normalized = field_name.lower()
+        if "week" in normalized:
+            return "weekly"
+        if "date" in normalized or "day" in normalized:
+            return "daily"
+        if "month" in normalized:
+            return "monthly"
+        if "quarter" in normalized:
+            return "quarterly"
+        if "year" in normalized:
+            return "yearly"
+    if dimension_fields:
+        return dimension_fields[0]
+    if len(columns) == 1:
+        return columns[0]
+    return "row"
+
+
+def _infer_dataset_semantic_role(row_count: int, columns: list[str], grain: str) -> str:
+    normalized_columns = " ".join(columns).lower()
+    if any(token in normalized_columns for token in ("reconcile", "reconciliation", "variance", "delta")):
+        return "reconciliation"
+    if row_count <= 1:
+        return "summary"
+    if grain in {"weekly", "daily", "monthly", "quarterly", "yearly"}:
+        return "trend"
+    return "distribution"
+
+
+def _eligible_chart_types(
+    *,
+    row_count: int,
+    dimension_fields: list[str],
+    measure_fields: list[str],
+    grain: str,
+) -> list[str]:
+    if row_count < 2 or not measure_fields:
+        return []
+    chart_types: list[str] = []
+    if dimension_fields:
+        if grain in {"weekly", "daily", "monthly", "quarterly", "yearly"}:
+            chart_types.extend(["line", "bar", "area"])
+        else:
+            chart_types.extend(["bar", "horizontal_bar"])
+        if len(dimension_fields) >= 2:
+            chart_types.append("heatmap")
+    elif row_count >= 3:
+        chart_types.extend(["histogram", "box"])
+    if len(measure_fields) >= 2:
+        chart_types.append("scatter")
+    return [chart_type for chart_type in chart_types if chart_type in SUPPORTED_CHART_TYPES]
+
+
+def _not_chartable_reason(
+    *,
+    row_count: int,
+    dimension_fields: list[str],
+    measure_fields: list[str],
+    eligible_chart_types: list[str],
+) -> str | None:
+    if row_count < 2:
+        return "row_count < 2 for chart rendering"
+    if not measure_fields:
+        return "no numeric measure fields"
+    if not dimension_fields and row_count < 3:
+        return "row_count < 3 for measure-only distribution rendering"
+    if not eligible_chart_types:
+        return "no valid affordance for runtime renderer capabilities"
+    return None
+
+
+def _source_rows_for_dataset(dataset: dict[str, Any]) -> list[dict[str, Any]]:
+    return [row for row in dataset.get("rows", []) if isinstance(row, dict)]
+
+
+def _first_time_field(dimension_fields: list[str]) -> str | None:
+    for field_name in dimension_fields:
+        if _is_time_dimension_field(field_name):
+            return field_name
+    return None
+
+
+def _append_affordance(
+    affordances: list[dict[str, Any]],
+    dataset: dict[str, Any],
+    *,
+    chart_type: str,
+    x_field: str | None = None,
+    y_field: str | None = None,
+    series_field: str | None = None,
+    value_field: str | None = None,
+) -> None:
+    parts = [
+        dataset["dataset_id"],
+        chart_type,
+        x_field or value_field or "value",
+        y_field or "count",
+        series_field or "no_series",
+    ]
+    affordance_id = _safe_artifact_name_component("__".join(parts), fallback=f"{dataset['dataset_id']}__{chart_type}")
+    affordance = {
+        "affordance_id": affordance_id,
+        "dataset_id": dataset["dataset_id"],
+        "chart_type": chart_type,
+        "x_field": x_field,
+        "y_field": y_field,
+        "series_field": series_field,
+        "value_field": value_field,
+        "row_count": dataset["row_count"],
+        "query_refs": list(dataset["query_refs"]),
+        "evidence_refs": list(dataset["evidence_refs"]),
+    }
+    affordances.append(affordance)
+
+
+def _build_affordances_for_dataset(dataset: dict[str, Any]) -> list[dict[str, Any]]:
+    if dataset.get("status") != "chartable":
+        return []
+    dimension_fields = list(dataset.get("dimension_fields", []))
+    measure_fields = list(dataset.get("measure_fields", []))
+    eligible = set(dataset.get("eligible_chart_types", []))
+    affordances: list[dict[str, Any]] = []
+
+    time_field = _first_time_field(dimension_fields)
+    if time_field and measure_fields and "line" in eligible:
+        series_field = next((field for field in dimension_fields if field != time_field), None)
+        _append_affordance(
+            affordances,
+            dataset,
+            chart_type="line",
+            x_field=time_field,
+            y_field=measure_fields[0],
+            series_field=series_field,
+        )
+    elif dimension_fields and measure_fields:
+        chart_type = "horizontal_bar" if "horizontal_bar" in eligible else "bar"
+        _append_affordance(
+            affordances,
+            dataset,
+            chart_type=chart_type,
+            x_field=dimension_fields[0],
+            y_field=measure_fields[0],
+        )
+
+    if len(measure_fields) >= 2 and "scatter" in eligible:
+        _append_affordance(
+            affordances,
+            dataset,
+            chart_type="scatter",
+            x_field=measure_fields[0],
+            y_field=measure_fields[1],
+        )
+    if not dimension_fields and measure_fields and "histogram" in eligible:
+        _append_affordance(
+            affordances,
+            dataset,
+            chart_type="histogram",
+            value_field=measure_fields[0],
+        )
+    return affordances
+
+
+def build_chart_affordance_bundle_from_session_evidence(
+    session_evidence: dict[str, Any],
+    *,
+    generated_at: float | None = None,
+) -> dict[str, Any]:
+    """
+    Build runtime-owned chart-ready datasets and affordances from persisted evidence.
+
+    The unit of chartability is a homogeneous query/schema group, not a business
+    evidence entry. Report evidence supplies admissible query lineage; runtime
+    only exposes deterministic rendering affordances for rows with a stable
+    shared schema.
+    """
+    session_slug = str(session_evidence.get("slug") or session_evidence.get("session_slug") or "")
+    session_id = str(session_evidence.get("session_id") or "legacy")
+    query_records = _query_records(session_evidence)
+    _evidence_by_ref, query_to_evidence_refs = _report_evidence_maps(session_evidence)
+
+    grouped_rows: dict[tuple[str, str, tuple[str, ...]], list[dict[str, Any]]] = {}
+    for query_ref_key in sorted(query_to_evidence_refs):
+        query_record = query_records.get(query_ref_key)
+        if not isinstance(query_record, dict):
             continue
+        if query_record.get("status") not in USABLE_QUERY_STATUSES:
+            continue
+        rows = query_record.get("result_rows")
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            columns = tuple(sorted(str(key) for key in row.keys()))
+            grouped_rows.setdefault((query_ref_key[0], query_ref_key[1], columns), []).append(
+                {
+                    "row_id": f"{query_ref_key[1]}_row_{index}",
+                    "source_row_index": index,
+                    "payload": dict(row),
+                }
+            )
+
+    datasets: list[dict[str, Any]] = []
+    chart_affordances: list[dict[str, Any]] = []
+    no_valid_affordance: list[dict[str, Any]] = []
+    for round_id, query_id, columns_tuple in sorted(grouped_rows):
+        columns = list(columns_tuple)
+        rows = grouped_rows[(round_id, query_id, columns_tuple)]
+        payload_rows = [row["payload"] for row in rows]
+        dimension_fields, measure_fields, null_rates = _classify_fields(payload_rows, columns)
+        grain = _infer_dataset_grain(columns, dimension_fields)
+        semantic_role = _infer_dataset_semantic_role(len(rows), columns, grain)
+        eligible = _eligible_chart_types(
+            row_count=len(rows),
+            dimension_fields=dimension_fields,
+            measure_fields=measure_fields,
+            grain=grain,
+        )
+        omission_reason = _not_chartable_reason(
+            row_count=len(rows),
+            dimension_fields=dimension_fields,
+            measure_fields=measure_fields,
+            eligible_chart_types=eligible,
+        )
+        safe_query_id = _safe_artifact_name_component(query_id, fallback="query")
+        dataset_id = _safe_artifact_name_component(
+            f"{safe_query_id}__{semantic_role}__{grain}__{_schema_signature(columns)[:10]}",
+            fallback=f"{safe_query_id}__dataset",
+        )
+        dataset = {
+            "dataset_id": dataset_id,
+            "schema_signature": _schema_signature(columns),
+            "columns": columns,
+            "guaranteed_fields": columns,
+            "dimension_fields": dimension_fields,
+            "measure_fields": measure_fields,
+            "grain": grain,
+            "semantic_role": semantic_role,
+            "row_count": len(rows),
+            "null_rates": null_rates,
+            "eligible_chart_types": eligible,
+            "query_refs": [{"round_id": round_id, "query_id": query_id}],
+            "evidence_refs": sorted(query_to_evidence_refs.get((round_id, query_id), [])),
+            "rows": rows,
+            "status": "not_chartable" if omission_reason else "chartable",
+        }
+        if omission_reason:
+            dataset["omission_reason"] = omission_reason
+        datasets.append(dataset)
+        affordances = _build_affordances_for_dataset(dataset)
+        chart_affordances.extend(affordances)
+        if dataset["status"] == "chartable" and not affordances:
+            reason = "chartable dataset produced no runtime-supported affordance"
+            no_valid_affordance.append(
+                {
+                    "layer": "no_valid_affordance",
+                    "dataset_id": dataset_id,
+                    "reason": reason,
+                }
+            )
+
+    omitted_datasets = [
+        {
+            "layer": "dataset_normalization_omitted",
+            "dataset_id": dataset["dataset_id"],
+            "reason": str(dataset.get("omission_reason") or "dataset is not chartable"),
+        }
+        for dataset in datasets
+        if dataset.get("status") != "chartable"
+    ]
+    return {
+        "session_slug": session_slug,
+        "session_id": session_id,
+        "datasets": datasets,
+        "chart_affordances": chart_affordances,
+        "normalization_report": {
+            "dataset_count": len(datasets),
+            "chartable_dataset_count": sum(1 for dataset in datasets if dataset.get("status") == "chartable"),
+            "affordance_count": len(chart_affordances),
+            "omitted_visuals": omitted_datasets + no_valid_affordance,
+        },
+        "generated_at": generated_at if generated_at is not None else time.time(),
+    }
+
+
+def persist_chart_affordance_bundle(
+    slug: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    session_evidence = load_session_evidence(slug, session_id=session_id, strict_session=bool(session_id))
+    bundle = build_chart_affordance_bundle_from_session_evidence(session_evidence)
+    path = persist_artifact(
+        slug,
+        "chart_affordances.json",
+        bundle,
+        session_id=session_id,
+        strict_session=bool(session_id),
+    )
+    return {
+        "chart_affordances": bundle,
+        "chart_affordances_path": path,
+    }
+
+
+def _required_affordance_fields(affordance: dict[str, Any]) -> list[str]:
+    chart_type = str(affordance.get("chart_type") or "")
+    if chart_type in {"line", "bar", "horizontal_bar", "scatter", "area"}:
+        required = [affordance.get("x_field"), affordance.get("y_field")]
+        series_field = affordance.get("series_field")
+        if isinstance(series_field, str) and series_field:
+            required.append(series_field)
+        return [str(field) for field in required if isinstance(field, str) and field]
+    if chart_type in {"histogram", "box"}:
+        value_field = affordance.get("value_field") or affordance.get("y_field") or affordance.get("x_field")
+        return [str(value_field)] if isinstance(value_field, str) and value_field else []
+    if chart_type == "heatmap":
+        return [
+            str(field)
+            for field in (affordance.get("x_field"), affordance.get("y_field"), affordance.get("value_field"))
+            if isinstance(field, str) and field
+        ]
+    return []
+
+
+def _plot_spec_from_affordance(affordance: dict[str, Any]) -> dict[str, Any]:
+    plot_spec: dict[str, Any] = {
+        "chart_type": affordance["chart_type"],
+        "sort": "source_order",
+    }
+    for field_name in ("x_field", "y_field", "series_field", "value_field"):
+        value = affordance.get(field_name)
+        if isinstance(value, str) and value:
+            plot_spec[field_name] = value
+    if isinstance(plot_spec.get("x_field"), str):
+        plot_spec["x_label"] = plot_spec["x_field"]
+    if isinstance(plot_spec.get("y_field"), str):
+        plot_spec["y_label"] = plot_spec["y_field"]
+    return plot_spec
+
+
+def compile_chart_specs_from_affordance_plan(
+    visualization_plan: dict[str, Any],
+    chart_affordance_bundle: dict[str, Any],
+    *,
+    generated_at: float | None = None,
+) -> dict[str, Any]:
+    """
+    Compile an LLM-authored affordance selection plan into concrete ChartSpecs.
+
+    The LLM-owned plan may choose only affordance IDs and report-facing prose.
+    Runtime owns fields, rows, plot specs, and lineage copied from the selected
+    affordance dataset.
+    """
+    session_slug = str(visualization_plan.get("session_slug") or chart_affordance_bundle.get("session_slug") or "")
+    session_id = str(visualization_plan.get("session_id") or chart_affordance_bundle.get("session_id") or "legacy")
+    datasets_by_id = {
+        str(dataset.get("dataset_id")): dataset
+        for dataset in chart_affordance_bundle.get("datasets", [])
+        if isinstance(dataset, dict) and isinstance(dataset.get("dataset_id"), str)
+    }
+    affordances_by_id = {
+        str(affordance.get("affordance_id")): affordance
+        for affordance in chart_affordance_bundle.get("chart_affordances", [])
+        if isinstance(affordance, dict) and isinstance(affordance.get("affordance_id"), str)
+    }
+
+    specs: list[dict[str, Any]] = []
+    omitted_visuals: list[dict[str, Any]] = []
+    normalization_omission_items: list[dict[str, Any]] = []
+    normalization_omissions = chart_affordance_bundle.get("normalization_report", {}).get("omitted_visuals")
+    if isinstance(normalization_omissions, list):
+        normalization_omission_items.extend(dict(item) for item in normalization_omissions if isinstance(item, dict))
+
+    charts = visualization_plan.get("charts")
+    if "specs" in visualization_plan:
+        charts = []
+        omitted_visuals.append(
+            {
+                "layer": "plan_selected_invalid_affordance",
+                "reason": "Direct ChartSpecBundle input is not accepted for governed chart planning; select affordance_id from chart_affordances.",
+            }
+        )
+    elif not isinstance(charts, list):
+        charts = []
+        omitted_visuals.append(
+            {
+                "layer": "plan_selected_invalid_affordance",
+                "reason": "Visualization plan charts must be a list",
+            }
+        )
+
+    for index, chart in enumerate(charts):
+        if not isinstance(chart, dict):
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_index": index,
+                    "reason": "Visualization plan chart entries must be objects",
+                }
+            )
+            continue
+        affordance_id = chart.get("affordance_id")
+        chart_id = str(chart.get("chart_id") or chart.get("plan_id") or f"chart_{index + 1}")
+        if not isinstance(affordance_id, str) or not affordance_id:
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_id": chart_id,
+                    "reason": "Visualization plan chart is missing affordance_id",
+                }
+            )
+            continue
+        affordance = affordances_by_id.get(affordance_id)
+        if not isinstance(affordance, dict):
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_id": chart_id,
+                    "affordance_id": affordance_id,
+                    "reason": f"Unknown chart affordance_id: {affordance_id}",
+                }
+            )
+            continue
+        dataset = datasets_by_id.get(str(affordance.get("dataset_id")))
+        if not isinstance(dataset, dict):
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_id": chart_id,
+                    "affordance_id": affordance_id,
+                    "reason": "Selected affordance dataset is not available",
+                }
+            )
+            continue
+        if dataset.get("status") != "chartable":
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_id": chart_id,
+                    "affordance_id": affordance_id,
+                    "reason": str(dataset.get("omission_reason") or "Selected affordance dataset is not chartable"),
+                }
+            )
+            continue
+
+        required_fields = _required_affordance_fields(affordance)
+        dataset_rows = _source_rows_for_dataset(dataset)
+        missing_fields = sorted(
+            {
+                field
+                for row in dataset_rows
+                for field in required_fields
+                if field not in row.get("payload", {})
+            }
+        )
+        if missing_fields:
+            omitted_visuals.append(
+                {
+                    "layer": "plan_selected_invalid_affordance",
+                    "chart_id": chart_id,
+                    "affordance_id": affordance_id,
+                    "reason": f"Selected affordance dataset rows are missing required fields: {', '.join(missing_fields)}",
+                }
+            )
+            continue
+
+        safe_chart_id = _safe_artifact_name_component(chart_id, fallback=f"chart_{index + 1}")
+        query_refs = list(dataset.get("query_refs", []))
+        evidence_refs = list(dataset.get("evidence_refs", []))
+        spec = {
+            "spec_id": safe_chart_id,
+            "affordance_id": affordance_id,
+            "dataset_id": dataset["dataset_id"],
+            "title": str(chart.get("title") or safe_chart_id),
+            "caption": str(chart.get("caption") or "Chart selected from a runtime-provided affordance."),
+            "semantic_chart_type": str(chart.get("semantic_chart_type") or f"{dataset.get('semantic_role')}_{affordance['chart_type']}"),
+            "narrative_role": str(chart.get("narrative_role") or "supporting_visual"),
+            "report_section": str(chart.get("report_section") or "visualizations"),
+            "evidence_refs": evidence_refs,
+            "query_refs": query_refs,
+            "source_query_ref": dict(query_refs[0]) if query_refs else {},
+            "plot_data": {
+                "items": [
+                    {
+                        "item_id": str(row.get("row_id") or f"{safe_chart_id}_row_{row_index + 1}"),
+                        "payload": dict(row.get("payload", {})),
+                        "source_row_index": int(row["source_row_index"]),
+                    }
+                    for row_index, row in enumerate(dataset_rows)
+                    if isinstance(row.get("source_row_index"), int)
+                ]
+            },
+            "plot_spec": _plot_spec_from_affordance(affordance),
+            "why_this_chart": str(chart.get("why_this_chart") or "Selected from a runtime-provided chart affordance."),
+        }
+        specs.append(spec)
+
+    omitted_visuals.extend(normalization_omission_items)
+    chart_spec_bundle = {
+        "session_slug": session_slug,
+        "session_id": session_id,
+        "specs": specs,
+        "generated_at": generated_at if generated_at is not None else time.time(),
+    }
+    validate_chart_spec_bundle(chart_spec_bundle)
+    chart_compile_report = {
+        "session_slug": session_slug,
+        "session_id": session_id,
+        "status": "compiled" if specs else "no_compiled_specs",
+        "compiled_count": len(specs),
+        "omitted_visuals": omitted_visuals,
+        "omission_reasons": sorted(
+            {
+                str(item.get("reason"))
+                for item in omitted_visuals
+                if isinstance(item, dict) and item.get("reason")
+            }
+        ),
+        "generated_at": generated_at if generated_at is not None else time.time(),
+    }
+    return {
+        "chart_spec_bundle": chart_spec_bundle,
+        "chart_compile_report": chart_compile_report,
+    }
+
+
+def _validate_plot_data_items(items: list[dict[str, Any]], source_rows: list[dict[str, Any]]) -> None:
+    max_index = len(source_rows) - 1
+    for item in items:
+        source_indexes: list[int] = []
         single_index = item.get("source_row_index")
         if isinstance(single_index, int):
             source_indexes.append(single_index)
         many_indexes = item.get("source_row_indexes")
         if isinstance(many_indexes, list):
             source_indexes.extend(index for index in many_indexes if isinstance(index, int))
-    if not source_indexes:
-        source_indexes = list(range(len(source_rows)))
-    for index in source_indexes:
-        if index < 0 or index > max_index:
-            raise ValueError("plot_data references source rows outside the available result set.")
-    if len(source_indexes) > MAX_CHART_RENDER_ROWS:
-        raise ValueError("source rows too large; query should pre-aggregate or limit rows")
-    return source_indexes
+        if not source_indexes:
+            raise ValueError("Each plot_data item must declare source_row_index or source_row_indexes.")
+        for index in source_indexes:
+            if index < 0 or index > max_index:
+                raise ValueError("plot_data references source rows outside the persisted result set.")
 
 
 def _load_matplotlib_pyplot() -> Any:
@@ -300,71 +847,6 @@ def _plot_payload_items(plot_data: dict[str, Any]) -> list[dict[str, Any]]:
     return payloads
 
 
-def _plot_spec_render_fields(plot_spec: dict[str, Any]) -> list[str]:
-    chart_type = str(plot_spec.get("chart_type") or "")
-    fields: list[str] = []
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value.strip() and value.strip() not in fields:
-            fields.append(value.strip())
-
-    if chart_type in {"line", "bar", "horizontal_bar", "scatter", "area"}:
-        add(plot_spec.get("x_field"))
-        add(plot_spec.get("y_field"))
-        add(plot_spec.get("series_field"))
-    elif chart_type in {"histogram", "box"}:
-        add(plot_spec.get("value_field") or plot_spec.get("y_field") or plot_spec.get("x_field"))
-    elif chart_type == "heatmap":
-        add(plot_spec.get("x_field"))
-        add(plot_spec.get("y_field"))
-        add(plot_spec.get("value_field"))
-    return fields
-
-
-def _materialize_plot_data_from_source_rows(
-    spec: dict[str, Any],
-    source_rows: list[dict[str, Any]],
-) -> tuple[dict[str, Any], list[str]]:
-    source_items = spec.get("plot_data", {}).get("items", [])
-    if not isinstance(source_items, list):
-        source_items = []
-    source_indexes = _plot_item_source_indexes(source_items, source_rows)
-    fields = _plot_spec_render_fields(spec["plot_spec"])
-    warnings: list[str] = []
-    materialized_items: list[dict[str, Any]] = []
-    for ordinal, source_index in enumerate(source_indexes):
-        row = source_rows[source_index]
-        payload = {field: row[field] for field in fields if field in row}
-        source_item = source_items[ordinal] if ordinal < len(source_items) and isinstance(source_items[ordinal], dict) else {}
-        source_payload = source_item.get("payload") if isinstance(source_item.get("payload"), dict) else {}
-        for field, value in payload.items():
-            if field in source_payload and source_payload[field] != value:
-                warnings.append(
-                    f"plot_data payload for source row {source_index} field {field!r} differed from runtime source rows and was ignored"
-                )
-        materialized_items.append(
-            {
-                "item_id": str(source_item.get("item_id") or f"row_{source_index}"),
-                "source_row_index": source_index,
-                "source_row_hash": stable_payload_hash(row),
-                "payload_origin": "runtime_source_rows",
-                "payload": payload,
-            }
-        )
-    plot_data = {
-        "spec_id": spec["spec_id"],
-        "semantic_chart_type": spec["semantic_chart_type"],
-        "renderer_hint": spec.get("renderer_hint"),
-        "source_query_ref": dict(spec["source_query_ref"]),
-        "items": materialized_items,
-        "plot_spec": dict(spec["plot_spec"]),
-        "payload_origin": "runtime_source_rows",
-    }
-    if warnings:
-        plot_data["payload_warnings"] = warnings
-    return plot_data, warnings
-
-
 def _require_plot_field(plot_spec: dict[str, Any], field_name: str) -> str:
     value = plot_spec.get(field_name)
     if not isinstance(value, str) or not value.strip():
@@ -376,7 +858,7 @@ def _field_values(rows: list[dict[str, Any]], field_name: str) -> list[Any]:
     values: list[Any] = []
     for row in rows:
         if field_name not in row:
-            raise ValueError(f"runtime source rows are missing required field: {field_name}")
+            raise ValueError(f"plot_data payload is missing required field: {field_name}")
         values.append(row[field_name])
     return values
 
@@ -420,7 +902,7 @@ def _series_groups(rows: list[dict[str, Any]], series_field: Any) -> list[tuple[
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if series_field not in row:
-            raise ValueError(f"runtime source rows are missing required field: {series_field}")
+            raise ValueError(f"plot_data payload is missing required field: {series_field}")
         grouped.setdefault(str(row[series_field]), []).append(row)
     return list(grouped.items())
 
@@ -576,6 +1058,8 @@ def _purge_rendered_result_rows(
                 bundle.get("contract") if isinstance(bundle.get("contract"), dict) else {},
                 executed_queries,
                 bundle.get("evaluation") if isinstance(bundle.get("evaluation"), dict) else {},
+                executed_web_searches=bundle.get("executed_web_searches", []) if isinstance(bundle.get("executed_web_searches"), list) else [],
+                web_recall_assessments=bundle.get("web_recall_assessments", []) if isinstance(bundle.get("web_recall_assessments"), list) else [],
                 generation_id=str(bundle.get("generation_id")) if isinstance(bundle.get("generation_id"), str) else None,
                 session_id=session_id,
                 strict_session=bool(session_id),
@@ -639,6 +1123,8 @@ def _persist_rehydrated_query(
         contract,
         updated_queries,
         evaluation,
+        executed_web_searches=bundle.get("executed_web_searches", []) if isinstance(bundle.get("executed_web_searches"), list) else [],
+        web_recall_assessments=bundle.get("web_recall_assessments", []) if isinstance(bundle.get("web_recall_assessments"), list) else [],
         generation_id=str(bundle.get("generation_id")) if isinstance(bundle.get("generation_id"), str) else None,
         session_id=session_id,
         strict_session=bool(session_id),
@@ -661,27 +1147,6 @@ def _rehydration_failure(round_id: str, query_id: str, reason: str) -> dict[str,
     }
 
 
-def _available_query_rows(
-    slug: str,
-    *,
-    session_id: str | None,
-    query_ref_key: tuple[str, str],
-    query_record: dict[str, Any],
-) -> tuple[list[dict[str, Any]] | None, str]:
-    if query_record.get("result_rows_persisted") is True and isinstance(query_record.get("result_rows"), list):
-        return [row for row in query_record["result_rows"] if isinstance(row, dict)], "persisted_result_rows"
-    round_id, query_id = query_ref_key
-    ephemeral_rows = get_ephemeral_result_rows(
-        slug,
-        session_id=session_id,
-        round_id=round_id,
-        query_id=query_id,
-    )
-    if isinstance(ephemeral_rows, list):
-        return [row for row in ephemeral_rows if isinstance(row, dict)], "ephemeral_result_rows"
-    return None, "unavailable"
-
-
 def _exception_reason(prefix: str, exc: Exception) -> str:
     message = str(exc).strip()
     if len(message) > 300:
@@ -698,7 +1163,6 @@ def _rehydrate_missing_chart_result_rows(
     timeout: float,
     max_rows: int,
     max_cache_age_seconds: float | None,
-    temporary_visualization_rows_max: int | None,
 ) -> list[dict[str, Any]]:
     source_refs: list[tuple[str, str]] = []
     seen_refs: set[tuple[str, str]] = set()
@@ -862,7 +1326,7 @@ def _rehydrate_missing_chart_result_rows(
                 runtime_request,
                 cached_rows,
                 warehouse_identity=warehouse_identity,
-                temporary_full_rows_max=temporary_visualization_rows_max,
+                temporary_full_rows_max=max_rows,
             )
             if not isinstance(retained_rows, list):
                 reason = retention_denial_reason or (
@@ -907,7 +1371,7 @@ def _rehydrate_missing_chart_result_rows(
                 timeout=timeout,
                 max_rows=max_rows,
                 max_cache_age_seconds=max_cache_age_seconds,
-                temporary_full_rows_max=temporary_visualization_rows_max,
+                temporary_full_rows_max=max_rows,
             )
         except Exception as exc:
             results.append(
@@ -963,7 +1427,6 @@ def render_chart_artifacts(
     client: Any | None = None,
     session_id: str | None = None,
     rehydrate_missing_result_rows: bool = False,
-    temporary_visualization_rows_max: int | None = None,
     timeout: float = 30.0,
     max_rows: int = 10_000,
     max_cache_age_seconds: float | None = None,
@@ -985,7 +1448,6 @@ def render_chart_artifacts(
             timeout=timeout,
             max_rows=max_rows,
             max_cache_age_seconds=max_cache_age_seconds,
-            temporary_visualization_rows_max=temporary_visualization_rows_max,
         )
         if any(result.get("status") == "recovered" for result in rehydration_results):
             session_evidence = load_session_evidence(slug, session_id=session_id, strict_session=bool(session_id))
@@ -999,6 +1461,11 @@ def render_chart_artifacts(
         if result.get("status") == "failed"
     }
 
+    chart_compile_report = (
+        session_evidence.get("chart_compile_report")
+        if isinstance(session_evidence.get("chart_compile_report"), dict)
+        else {}
+    )
     query_records = _query_records(session_evidence)
     evidence_by_ref, query_to_evidence_refs = _report_evidence_maps(session_evidence)
 
@@ -1011,6 +1478,28 @@ def render_chart_artifacts(
         if result.get("status") == "recovered" and isinstance(result.get("source_result_hash"), str)
     }
 
+    compile_omissions = chart_compile_report.get("omitted_visuals")
+    if isinstance(compile_omissions, list):
+        for item in compile_omissions:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get("reason") or "chart omitted during chart spec compilation")
+            omitted_visuals.append(
+                {
+                    **item,
+                    "layer": str(item.get("layer") or "plan_selected_invalid_affordance"),
+                    "reason": reason,
+                }
+            )
+            summaries.append(
+                {
+                    "spec_id": str(item.get("chart_id") or item.get("dataset_id") or item.get("affordance_id") or "chart_compile"),
+                    "semantic_chart_type": str(item.get("layer") or "chart_compile"),
+                    "rendered": False,
+                    "notes": [reason],
+                }
+            )
+
     for spec in chart_spec_bundle["specs"]:
         spec_id = str(spec["spec_id"])
         reason: str | None = None
@@ -1021,6 +1510,11 @@ def render_chart_artifacts(
             reason = "source query ref is not available in persisted session evidence"
         elif query_record.get("status") not in USABLE_QUERY_STATUSES:
             reason = "source query status is not eligible for chart rendering"
+        elif not query_record.get("result_rows_persisted") or not isinstance(query_record.get("result_rows"), list):
+            reason = "source query result rows were not retained for rendering"
+            rehydration_failure = rehydration_failures.get(query_ref_key)
+            if isinstance(rehydration_failure, dict) and rehydration_failure.get("reason"):
+                reason = f"{reason}; {rehydration_failure['reason']}"
         else:
             for evidence_ref in spec["evidence_refs"]:
                 if evidence_ref not in evidence_by_ref:
@@ -1031,7 +1525,7 @@ def render_chart_artifacts(
                 if not set(spec["evidence_refs"]).issubset(query_linked_evidence):
                     reason = "chart spec evidence refs are not linked to the referenced query"
         if reason is not None:
-            omitted_visuals.append({"spec_id": spec_id, "reason": reason})
+            omitted_visuals.append({"spec_id": spec_id, "layer": "render_failed", "reason": reason})
             summaries.append(
                 {
                     "spec_id": spec_id,
@@ -1042,33 +1536,20 @@ def render_chart_artifacts(
             )
             continue
 
-        raw_rows, row_source = _available_query_rows(
-            slug,
-            session_id=session_id,
-            query_ref_key=query_ref_key,
-            query_record=query_record,
-        )
-        if raw_rows is None:
-            reason = "source query result rows were not available for rendering"
-            rehydration_failure = rehydration_failures.get(query_ref_key)
-            if isinstance(rehydration_failure, dict) and rehydration_failure.get("reason"):
-                reason = f"{reason}; {rehydration_failure['reason']}"
-            omitted_visuals.append({"spec_id": spec_id, "reason": reason})
-            summaries.append(
-                {
-                    "spec_id": spec_id,
-                    "semantic_chart_type": spec["semantic_chart_type"],
-                    "rendered": False,
-                    "notes": [reason],
-                }
-            )
-            continue
-
+        raw_rows = [row for row in query_record["result_rows"] if isinstance(row, dict)]
         source_result_hash = stable_payload_hash(raw_rows)
+        query_source_hashes_for_cleanup[query_ref_key] = source_result_hash
         try:
-            plot_data, payload_warnings = _materialize_plot_data_from_source_rows(spec, raw_rows)
-            render_spec = {**spec, "plot_data": {"items": plot_data["items"]}}
-            png_bytes = _render_matplotlib_chart_png(render_spec)
+            plot_data = {
+                "spec_id": spec["spec_id"],
+                "semantic_chart_type": spec["semantic_chart_type"],
+                "renderer_hint": spec.get("renderer_hint"),
+                "source_query_ref": dict(spec["source_query_ref"]),
+                "items": list(spec["plot_data"]["items"]),
+                "plot_spec": dict(spec["plot_spec"]),
+            }
+            _validate_plot_data_items(plot_data["items"], raw_rows)
+            png_bytes = _render_matplotlib_chart_png(spec)
             safe_spec_id = _safe_artifact_name_component(spec_id, fallback="chart")
             chart_id = f"{len(charts) + 1:02d}_{safe_spec_id}"
             plot_data_path = persist_artifact(
@@ -1089,7 +1570,7 @@ def render_chart_artifacts(
             )
         except ValueError as exc:
             reason = str(exc)
-            omitted_visuals.append({"spec_id": spec_id, "reason": reason})
+            omitted_visuals.append({"spec_id": spec_id, "layer": "render_failed", "reason": reason})
             summaries.append(
                 {
                     "spec_id": spec_id,
@@ -1100,8 +1581,6 @@ def render_chart_artifacts(
             )
             continue
 
-        if row_source == "persisted_result_rows":
-            query_source_hashes_for_cleanup[query_ref_key] = source_result_hash
         charts.append(
             {
                 "chart_id": chart_id,
@@ -1125,19 +1604,9 @@ def render_chart_artifacts(
                 "spec_id": spec_id,
                 "semantic_chart_type": spec["semantic_chart_type"],
                 "rendered": True,
-                "notes": [
-                    f"Rendered from {source_query_ref['round_id']}:{source_query_ref['query_id']} using {row_source}."
-                ]
-                + payload_warnings,
+                "notes": [f"Rendered from {source_query_ref['round_id']}:{source_query_ref['query_id']}."],
             }
         )
-        if row_source == "ephemeral_result_rows":
-            clear_ephemeral_result_rows(
-                slug,
-                session_id=session_id,
-                round_id=query_ref_key[0],
-                query_id=query_ref_key[1],
-            )
 
     retention_cleanup = _purge_rendered_result_rows(
         slug,
@@ -1147,7 +1616,7 @@ def render_chart_artifacts(
     omission_reasons = sorted({item["reason"] for item in omitted_visuals})
     if charts:
         coverage = "charts_generated"
-    elif chart_spec_bundle["specs"]:
+    elif chart_spec_bundle["specs"] or omitted_visuals:
         coverage = "text_only"
     else:
         coverage = "no_chartable_evidence"
@@ -1156,12 +1625,13 @@ def render_chart_artifacts(
         "session_slug": slug,
         "session_id": session_evidence.get("session_id") or "legacy",
         "visualization_coverage": coverage,
+        "visualization_status": coverage,
+        "charts_generated_count": len(charts),
         "statistical_summary": summaries,
         "omitted_visuals": omitted_visuals,
         "omission_reasons": omission_reasons,
         "rehydration": {
             "attempted": bool(rehydrate_missing_result_rows),
-            "temporary_visualization_rows_max": temporary_visualization_rows_max,
             "results": rehydration_results,
             "recovered_count": sum(1 for result in rehydration_results if result.get("status") == "recovered"),
             "failed_count": sum(1 for result in rehydration_results if result.get("status") == "failed"),

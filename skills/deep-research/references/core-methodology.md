@@ -10,7 +10,7 @@ It does not define shared object schemas. Shared contracts live in `contracts.md
 
 1. **Baseline before claims**: verify that the headline issue is real before promoting any driver explanation.
 2. **Bounded investigation**: every round is governed by an explicit `InvestigationContract`.
-3. **Traceable evidence**: every promoted claim must trace to concrete query evidence.
+3. **Traceable evidence**: every promoted claim must trace to concrete SQL, web, or evaluation evidence.
 4. **Graceful degradation**: when load or runtime constraints block decisive tests, produce an honest partial answer rather than widening the scan.
 5. **Honest uncertainty**: contradictions and unresolved rival explanations must stay visible.
 

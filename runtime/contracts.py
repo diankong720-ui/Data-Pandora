@@ -5,23 +5,7 @@ import json
 from typing import Any
 
 QUESTION_STYLES = {"abstract", "operational", "comparative"}
-BUSINESS_OBJECT_ENTITY_TYPES = {
-    "business_scope",
-    "channel",
-    "product",
-    "region",
-    "seller",
-    "device",
-    "machine",
-    "store",
-    "customer",
-    "merchant",
-    "category",
-    "sku",
-    "asset",
-    "location",
-    "other",
-}
+BUSINESS_OBJECT_ENTITY_TYPES = {"business_scope", "channel", "product", "region", "seller"}
 TIME_GRAINS = {"day", "week", "month", "quarter", "year", "rolling_window", "unknown"}
 COMPARISON_SCOPE_TYPES = {"none", "mom", "yoy", "explicit", "custom"}
 MAPPING_CONFIDENCE_LEVELS = {"high", "low"}
@@ -34,6 +18,27 @@ HYPOTHESIS_CLASSES = {"audit", "driver"}
 HYPOTHESIS_LAYERS = {"audit", "demand", "value", "structure", "fulfillment"}
 SCHEMA_FEASIBILITY_STATUSES = {"feasible", "not_testable"}
 HYPOTHESIS_STATUSES = {"proposed", "supported", "weakened", "rejected", "not_tested", "blocked_by_load"}
+EVIDENCE_LANES = {"warehouse_sql", "web_search"}
+WEB_SEARCH_STATUSES = {"success", "failed", "timeout", "blocked"}
+WEB_RECALL_SCORE_FIELDS = {
+    "temporal_fit",
+    "entity_fit",
+    "source_authority",
+    "source_independence",
+    "corroboration_strength",
+    "specificity",
+    "freshness",
+    "retrieval_diversity",
+    "contradiction_signal",
+    "actionability",
+}
+WEB_RECALL_CONCLUSIONS = {
+    "usable_supporting",
+    "usable_contradicting",
+    "usable_contextual",
+    "needs_refinement",
+    "insufficient",
+}
 CONTINUATION_ACTIONS = {"refine", "pivot"}
 TRANSITION_MODES = {"normal", "rework", "restart"}
 STAGE_DECISION_PHASES = {"enter", "complete", "restart"}
@@ -80,6 +85,18 @@ def _require_non_empty_string_list(value: Any, label: str) -> list[str]:
         _require_non_empty_string(item, f"{label}[{index}]")
         normalized.append(str(item).strip())
     return normalized
+
+
+def _require_non_empty_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{label} must be a non-empty object.")
+    return value
+
+
+def _require_non_negative_int(value: Any, label: str) -> int:
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer.")
+    return value
 
 
 def _normalize_change_note(value: Any, label: str) -> str:
@@ -333,6 +350,171 @@ def validate_query_execution_request(request: dict[str, Any]) -> None:
         )
 
 
+def _has_residual_binding(request: dict[str, Any], label: str) -> bool:
+    has_open_question_binding = bool(request.get("addresses_open_question_ids"))
+    has_residual_binding = isinstance(request.get("addresses_residual_component"), str) and bool(
+        str(request.get("addresses_residual_component")).strip()
+    )
+    if has_open_question_binding:
+        _require_non_empty_string_list(
+            request["addresses_open_question_ids"],
+            f"{label}.addresses_open_question_ids",
+        )
+    if has_residual_binding:
+        _require_non_empty_string(
+            request["addresses_residual_component"],
+            f"{label}.addresses_residual_component",
+        )
+    return has_open_question_binding or has_residual_binding
+
+
+def validate_web_search_request(request: dict[str, Any]) -> None:
+    required_fields = (
+        "search_id",
+        "question",
+        "query",
+        "time_window",
+        "geo_scope",
+        "entity_scope",
+        "source_policy",
+        "freshness_requirement",
+        "expected_signal",
+    )
+    _require_fields(request, required_fields, "WebSearchRequest")
+    for field in ("search_id", "question", "query", "expected_signal"):
+        _require_non_empty_string(request[field], f"WebSearchRequest.{field}")
+    time_window = _require_non_empty_object(request["time_window"], "WebSearchRequest.time_window")
+    if not (
+        isinstance(time_window.get("label"), str)
+        and time_window["label"].strip()
+        or isinstance(time_window.get("start"), str)
+        and time_window["start"].strip()
+        and isinstance(time_window.get("end"), str)
+        and time_window["end"].strip()
+    ):
+        raise ValueError("WebSearchRequest.time_window must include a label or start/end.")
+    geo_scope = request["geo_scope"]
+    if isinstance(geo_scope, str):
+        _require_non_empty_string(geo_scope, "WebSearchRequest.geo_scope")
+    else:
+        _require_non_empty_object(geo_scope, "WebSearchRequest.geo_scope")
+    entity_scope = request["entity_scope"]
+    if isinstance(entity_scope, list):
+        _require_non_empty_string_list(entity_scope, "WebSearchRequest.entity_scope")
+    else:
+        _require_non_empty_object(entity_scope, "WebSearchRequest.entity_scope")
+    _require_non_empty_object(request["source_policy"], "WebSearchRequest.source_policy")
+    freshness_requirement = request["freshness_requirement"]
+    if isinstance(freshness_requirement, str):
+        _require_non_empty_string(
+            freshness_requirement,
+            "WebSearchRequest.freshness_requirement",
+        )
+    else:
+        _require_non_empty_object(
+            freshness_requirement,
+            "WebSearchRequest.freshness_requirement",
+        )
+    if not _has_residual_binding(request, "WebSearchRequest"):
+        raise ValueError("WebSearchRequest must bind to open questions or a residual component.")
+
+    is_refinement = "parent_search_id" in request
+    if is_refinement:
+        for field in ("parent_search_id", "recall_gap", "refined_question", "expected_new_signal"):
+            _require_non_empty_string(request.get(field), f"WebSearchRequest.{field}")
+        _require_non_empty_string_list(request.get("changed_axes"), "WebSearchRequest.changed_axes")
+        if request["parent_search_id"] == request["search_id"]:
+            raise ValueError("WebSearchRequest.parent_search_id must differ from search_id.")
+
+
+def validate_web_search_result(result: dict[str, Any]) -> None:
+    required_fields = (
+        "search_id",
+        "status",
+        "provider",
+        "retrieved_at",
+        "results",
+        "fetched_pages",
+        "source_quality_notes",
+    )
+    _require_fields(result, required_fields, "WebSearchResult")
+    _require_non_empty_string(result["search_id"], "WebSearchResult.search_id")
+    _require_enum(result["status"], WEB_SEARCH_STATUSES, "WebSearchResult.status")
+    _require_non_empty_string(result["provider"], "WebSearchResult.provider")
+    if not isinstance(result["retrieved_at"], (int, float)):
+        raise ValueError("WebSearchResult.retrieved_at must be numeric.")
+    if not isinstance(result["results"], list):
+        raise ValueError("WebSearchResult.results must be a list.")
+    if not isinstance(result["fetched_pages"], list):
+        raise ValueError("WebSearchResult.fetched_pages must be a list.")
+    if not isinstance(result["source_quality_notes"], list):
+        raise ValueError("WebSearchResult.source_quality_notes must be a list.")
+    for item in result["results"]:
+        if not isinstance(item, dict):
+            raise ValueError("WebSearchResult.results entries must be objects.")
+        _require_fields(item, ("title", "url"), "WebSearchResult.result")
+        _require_non_empty_string(item["title"], "WebSearchResult.result.title")
+        _require_non_empty_string(item["url"], "WebSearchResult.result.url")
+
+
+def validate_web_recall_assessment(assessment: dict[str, Any]) -> None:
+    required_fields = (
+        "assessment_id",
+        "search_id",
+        "scores",
+        "conclusion",
+        "rationale",
+        "needs_refinement",
+        "refinement_requests",
+    )
+    _require_fields(assessment, required_fields, "WebRecallAssessment")
+    _require_non_empty_string(assessment["assessment_id"], "WebRecallAssessment.assessment_id")
+    _require_non_empty_string(assessment["search_id"], "WebRecallAssessment.search_id")
+    scores = assessment["scores"]
+    if not isinstance(scores, dict):
+        raise ValueError("WebRecallAssessment.scores must be an object.")
+    missing_scores = WEB_RECALL_SCORE_FIELDS - set(scores)
+    if missing_scores:
+        raise ValueError(
+            "WebRecallAssessment.scores missing fields: " + ", ".join(sorted(missing_scores))
+        )
+    for field in WEB_RECALL_SCORE_FIELDS:
+        value = scores[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 5:
+            raise ValueError(f"WebRecallAssessment.scores.{field} must be an integer from 0 to 5.")
+    _require_enum(assessment["conclusion"], WEB_RECALL_CONCLUSIONS, "WebRecallAssessment.conclusion")
+    _require_non_empty_string(assessment["rationale"], "WebRecallAssessment.rationale")
+    if not isinstance(assessment["needs_refinement"], bool):
+        raise ValueError("WebRecallAssessment.needs_refinement must be a boolean.")
+    if assessment["needs_refinement"] and assessment["conclusion"] != "needs_refinement":
+        raise ValueError("WebRecallAssessment.needs_refinement=true requires conclusion=needs_refinement.")
+    if assessment["conclusion"] == "usable_contradicting":
+        _require_non_empty_string(
+            assessment.get("contradiction_summary"),
+            "WebRecallAssessment.contradiction_summary",
+        )
+    refinement_requests = assessment["refinement_requests"]
+    if not isinstance(refinement_requests, list):
+        raise ValueError("WebRecallAssessment.refinement_requests must be a list.")
+    for request in refinement_requests:
+        if not isinstance(request, dict):
+            raise ValueError("WebRecallAssessment.refinement_requests entries must be objects.")
+        validate_web_search_request(request)
+        if request.get("parent_search_id") != assessment["search_id"]:
+            raise ValueError("WebRecallAssessment refinement requests must point to assessment.search_id.")
+
+
+def validate_web_refs(value: Any, label: str) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list.")
+    for web_ref in value:
+        if not isinstance(web_ref, dict):
+            raise ValueError(f"{label} entries must be objects.")
+        _require_fields(web_ref, ("round_id", "search_id"), f"{label}.entry")
+        _require_non_empty_string(web_ref["round_id"], f"{label}.round_id")
+        _require_non_empty_string(web_ref["search_id"], f"{label}.search_id")
+
+
 def validate_investigation_contract(contract: dict[str, Any]) -> None:
     required_fields = (
         "contract_id",
@@ -365,6 +547,12 @@ def validate_investigation_contract(contract: dict[str, Any]) -> None:
     for value in contract["allowed_cost_classes"]:
         _require_non_empty_string(value, "InvestigationContract.allowed_cost_classes[]")
         allowed_cost_classes.add(value)
+    evidence_lanes = contract.get("evidence_lanes")
+    if evidence_lanes is not None:
+        if not isinstance(evidence_lanes, list) or not evidence_lanes:
+            raise ValueError("InvestigationContract.evidence_lanes must be a non-empty list when provided.")
+        for lane in evidence_lanes:
+            _require_enum(lane, EVIDENCE_LANES, "InvestigationContract.evidence_lanes[]")
     if not isinstance(contract["queries"], list):
         raise ValueError("InvestigationContract.queries must be a list.")
     if len(contract["queries"]) > contract["sql_budget"]:
@@ -375,6 +563,53 @@ def validate_investigation_contract(contract: dict[str, Any]) -> None:
         validate_query_execution_request(query)
         if query["cost_class"] not in allowed_cost_classes:
             raise ValueError("InvestigationContract query cost_class is not allowed by allowed_cost_classes.")
+    web_searches = contract.get("web_searches", [])
+    if web_searches is None:
+        web_searches = []
+    if not isinstance(web_searches, list):
+        raise ValueError("InvestigationContract.web_searches must be a list when provided.")
+    if web_searches:
+        if evidence_lanes is None or "web_search" not in evidence_lanes:
+            raise ValueError("InvestigationContract.evidence_lanes must include web_search when web_searches are present.")
+        if contract["queries"] and "warehouse_sql" not in evidence_lanes:
+            raise ValueError("InvestigationContract.evidence_lanes must include warehouse_sql when queries are present.")
+        web_search_budget = contract.get("web_search_budget")
+        if not isinstance(web_search_budget, int) or web_search_budget <= 0:
+            raise ValueError("InvestigationContract.web_search_budget must be a positive integer when web_searches are present.")
+        web_refinement_budget = _require_non_negative_int(
+            contract.get("web_refinement_budget"),
+            "InvestigationContract.web_refinement_budget",
+        )
+        if len(web_searches) > web_search_budget:
+            raise ValueError("InvestigationContract.web_searches exceeds InvestigationContract.web_search_budget.")
+        refinement_count = sum(
+            1
+            for search in web_searches
+            if isinstance(search, dict) and isinstance(search.get("parent_search_id"), str)
+        )
+        if refinement_count > web_refinement_budget:
+            raise ValueError("InvestigationContract.web_searches exceeds InvestigationContract.web_refinement_budget.")
+    elif evidence_lanes is not None and "web_search" in evidence_lanes:
+        _require_non_negative_int(
+            contract.get("web_search_budget", 0),
+            "InvestigationContract.web_search_budget",
+        )
+        _require_non_negative_int(
+            contract.get("web_refinement_budget", 0),
+            "InvestigationContract.web_refinement_budget",
+        )
+    seen_search_ids: set[str] = set()
+    for search in web_searches:
+        if not isinstance(search, dict):
+            raise ValueError("InvestigationContract.web_searches entries must be objects.")
+        validate_web_search_request(search)
+        search_id = search["search_id"]
+        if search_id in seen_search_ids:
+            raise ValueError(f"Duplicate search_id in InvestigationContract: {search_id}")
+        seen_search_ids.add(search_id)
+        parent_search_id = search.get("parent_search_id")
+        if isinstance(parent_search_id, str) and parent_search_id not in seen_search_ids:
+            raise ValueError("WebSearchRequest.parent_search_id must reference an earlier search in the same contract.")
     round_number = contract.get("round_number")
     if isinstance(round_number, int) and round_number > 1:
         lineage_fields = (
@@ -485,13 +720,14 @@ def validate_investigation_contract(contract: dict[str, Any]) -> None:
                 f"Round2PlusInvestigationContract.material_change_reason.{field}",
             )
         for query in contract["queries"]:
-            has_open_question_binding = bool(query.get("addresses_open_question_ids"))
-            has_residual_binding = isinstance(query.get("addresses_residual_component"), str) and bool(
-                str(query.get("addresses_residual_component")).strip()
-            )
-            if not (has_open_question_binding or has_residual_binding):
+            if not _has_residual_binding(query, "Round2PlusInvestigationContract.query"):
                 raise ValueError(
                     "Round2PlusInvestigationContract queries must bind to target open questions or a residual component."
+                )
+        for search in web_searches:
+            if not _has_residual_binding(search, "Round2PlusInvestigationContract.web_search"):
+                raise ValueError(
+                    "Round2PlusInvestigationContract web_searches must bind to target open questions or a residual component."
                 )
 
 
@@ -518,6 +754,20 @@ def validate_hypothesis_board_item(item: dict[str, Any]) -> None:
         "HypothesisBoardItem.schema_feasibility",
     )
     _require_enum(item["status"], HYPOTHESIS_STATUSES, "HypothesisBoardItem.status")
+    if "evidence_channel_plan" in item:
+        channel_plan = item["evidence_channel_plan"]
+        if not isinstance(channel_plan, dict):
+            raise ValueError("HypothesisBoardItem.evidence_channel_plan must be an object when provided.")
+        lanes = channel_plan.get("lanes")
+        if not isinstance(lanes, list) or not lanes:
+            raise ValueError("HypothesisBoardItem.evidence_channel_plan.lanes must be a non-empty list.")
+        for lane in lanes:
+            _require_enum(lane, EVIDENCE_LANES, "HypothesisBoardItem.evidence_channel_plan.lanes[]")
+        if "rationale" in channel_plan:
+            _require_non_empty_string(
+                channel_plan["rationale"],
+                "HypothesisBoardItem.evidence_channel_plan.rationale",
+            )
 
 
 def validate_plan_bundle(bundle: dict[str, Any]) -> None:
@@ -727,6 +977,8 @@ def validate_report_evidence_index(index: dict[str, Any]) -> None:
     _require_non_empty_string(index["session_id"], "ReportEvidenceIndex.session_id")
     if not isinstance(index["report_evidence_refs"], list):
         raise ValueError("ReportEvidenceIndex.report_evidence_refs must be a list.")
+    if "web_evidence_refs" in index and not isinstance(index["web_evidence_refs"], list):
+        raise ValueError("ReportEvidenceIndex.web_evidence_refs must be a list when provided.")
     if not isinstance(index["generated_at"], (int, float)):
         raise ValueError("ReportEvidenceIndex.generated_at must be numeric.")
     for item in index["report_evidence_refs"]:
@@ -746,6 +998,23 @@ def validate_report_evidence_index(index: dict[str, Any]) -> None:
         _require_non_empty_string(item["round_id"], "ReportEvidenceIndex.entry.round_id")
         _require_non_empty_string(item["query_id"], "ReportEvidenceIndex.entry.query_id")
         _require_non_empty_string(item["reason"], "ReportEvidenceIndex.entry.reason")
+    for item in index.get("web_evidence_refs", []):
+        if not isinstance(item, dict):
+            raise ValueError("ReportEvidenceIndex.web_evidence_refs entries must be objects.")
+        _require_fields(
+            item,
+            (
+                "section",
+                "round_id",
+                "search_id",
+                "reason",
+            ),
+            "ReportEvidenceIndex.web_entry",
+        )
+        _require_enum(item["section"], REPORT_EVIDENCE_SECTIONS, "ReportEvidenceIndex.web_entry.section")
+        _require_non_empty_string(item["round_id"], "ReportEvidenceIndex.web_entry.round_id")
+        _require_non_empty_string(item["search_id"], "ReportEvidenceIndex.web_entry.search_id")
+        _require_non_empty_string(item["reason"], "ReportEvidenceIndex.web_entry.reason")
 
 
 def validate_report_evidence_bundle(bundle: dict[str, Any]) -> None:
@@ -783,6 +1052,8 @@ def validate_report_evidence_bundle(bundle: dict[str, Any]) -> None:
         _require_non_empty_string(entry["text"], "ReportEvidenceBundle.entry.text")
         if not isinstance(entry["query_refs"], list):
             raise ValueError("ReportEvidenceBundle.entry.query_refs must be a list.")
+        if "web_refs" in entry:
+            validate_web_refs(entry["web_refs"], "ReportEvidenceBundle.entry.web_refs")
         if "evaluation_refs" in entry and not isinstance(entry["evaluation_refs"], list):
             raise ValueError("ReportEvidenceBundle.entry.evaluation_refs must be a list when provided.")
         if "importance" in entry and not isinstance(entry["importance"], int):
@@ -869,9 +1140,9 @@ def validate_chart_spec_bundle(bundle: dict[str, Any]) -> None:
         for item in spec["plot_data"]["items"]:
             if not isinstance(item, dict):
                 raise ValueError("ChartSpec.plot_data.items entries must be objects.")
-            _require_fields(item, ("item_id",), "ChartSpec.plot_data.item")
+            _require_fields(item, ("item_id", "payload"), "ChartSpec.plot_data.item")
             _require_non_empty_string(item["item_id"], "ChartSpec.plot_data.item.item_id")
-            if "payload" in item and not isinstance(item["payload"], dict):
+            if not isinstance(item["payload"], dict):
                 raise ValueError("ChartSpec.plot_data.item.payload must be an object.")
             if "source_row_index" in item and not isinstance(item["source_row_index"], int):
                 raise ValueError("ChartSpec.plot_data.item.source_row_index must be an integer when provided.")

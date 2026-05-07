@@ -51,7 +51,18 @@ from runtime.contracts import (
     validate_report_evidence_index,
     validate_stage_decision,
     validate_tool_usage_envelope,
+    validate_web_recall_assessment,
+    validate_web_refs,
+    validate_web_search_request,
+    validate_web_search_result,
     validate_visualization_manifest,
+)
+from runtime.web_search import (
+    TavilySearchClient,
+    WebSearchClient,
+    execute_web_search_request,
+    get_web_search_configuration_status,
+    resolve_default_web_client,
 )
 from runtime.evaluation import (
     blocked_runtime_preconditions_met,
@@ -66,8 +77,10 @@ from runtime.final_answer import (
     validate_final_answer,
 )
 from runtime.orchestration import (
+    execute_evidence_contract,
     execute_investigation_contract,
     execute_round_and_persist,
+    execute_web_searches_for_contract,
     finalize_session,
 )
 from runtime.protocol_guards import (
@@ -108,7 +121,12 @@ from runtime.session_orchestration import (
     persist_suggestion_synthesis_stage,
     run_research_session,
 )
-from runtime.visualization import generate_visualization_artifacts
+from runtime.visualization import (
+    build_chart_affordance_bundle_from_session_evidence,
+    compile_chart_specs_from_affordance_plan,
+    generate_visualization_artifacts,
+    persist_chart_affordance_bundle,
+)
 from runtime.visualization import set_report_template
 from runtime.visualization_capabilities import get_visualization_capabilities
 from runtime.session_state import (
@@ -176,6 +194,10 @@ __all__ = [
     "validate_plan_bundle",
     "validate_report_evidence_bundle",
     "validate_report_evidence_index",
+    "validate_web_search_request",
+    "validate_web_search_result",
+    "validate_web_recall_assessment",
+    "validate_web_refs",
     "validate_chart_spec_bundle",
     "validate_descriptive_stats_bundle",
     "validate_visualization_manifest",
@@ -183,6 +205,11 @@ __all__ = [
     "validate_action_rationale",
     "validate_tool_usage_envelope",
     "validate_compliance_report",
+    "WebSearchClient",
+    "TavilySearchClient",
+    "execute_web_search_request",
+    "get_web_search_configuration_status",
+    "resolve_default_web_client",
     "validate_round_evaluation_result",
     "persist_round_evaluation",
     "summarize_execution_outcomes",
@@ -194,6 +221,8 @@ __all__ = [
     "validate_domain_pack_suggestions",
     "persist_domain_pack_suggestions",
     "execute_investigation_contract",
+    "execute_web_searches_for_contract",
+    "execute_evidence_contract",
     "execute_round_and_persist",
     "finalize_session",
     "ProtocolViolation",
@@ -249,5 +278,8 @@ __all__ = [
     "persist_suggestion_synthesis_stage",
     "run_research_session",
     "generate_visualization_artifacts",
+    "build_chart_affordance_bundle_from_session_evidence",
+    "persist_chart_affordance_bundle",
+    "compile_chart_specs_from_affordance_plan",
     "get_visualization_capabilities",
 ]

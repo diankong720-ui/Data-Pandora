@@ -151,9 +151,12 @@ def build_evidence_graph(slug: str, *, session_id: str | None = None) -> dict[st
         strict_session=bool(session_id),
     )
     query_nodes: list[dict[str, Any]] = []
+    web_nodes: list[dict[str, Any]] = []
+    web_recall_nodes: list[dict[str, Any]] = []
     evaluation_nodes: list[dict[str, Any]] = []
     claim_edges: list[dict[str, Any]] = []
     known_query_refs: set[tuple[str, str]] = set()
+    known_web_refs: set[tuple[str, str]] = set()
     known_eval_refs: set[str] = set()
 
     for bundle in round_bundles:
@@ -184,6 +187,35 @@ def build_evidence_graph(slug: str, *, session_id: str | None = None) -> dict[st
             )
             if isinstance(round_id, str):
                 known_query_refs.add((round_id, query_id))
+        for search in bundle.get("executed_web_searches", []) if isinstance(bundle, dict) else []:
+            search_id = search.get("search_id")
+            if not isinstance(search_id, str):
+                continue
+            web_nodes.append(
+                {
+                    "round_id": round_id,
+                    "search_id": search_id,
+                    "status": search.get("status"),
+                    "provider": search.get("provider"),
+                    "result_count": len(search.get("results", [])) if isinstance(search.get("results"), list) else 0,
+                }
+            )
+            if isinstance(round_id, str):
+                known_web_refs.add((round_id, search_id))
+        for assessment in bundle.get("web_recall_assessments", []) if isinstance(bundle, dict) else []:
+            assessment_id = assessment.get("assessment_id")
+            search_id = assessment.get("search_id")
+            if not isinstance(assessment_id, str) or not isinstance(search_id, str):
+                continue
+            web_recall_nodes.append(
+                {
+                    "round_id": round_id,
+                    "assessment_id": assessment_id,
+                    "search_id": search_id,
+                    "conclusion": assessment.get("conclusion"),
+                    "needs_refinement": assessment.get("needs_refinement"),
+                }
+            )
 
     if isinstance(final_answer, dict):
         for index, claim in enumerate(final_answer.get("supported_claims", []), start=1):
@@ -208,14 +240,27 @@ def build_evidence_graph(slug: str, *, session_id: str | None = None) -> dict[st
                         "kind": "evaluation_ref",
                     }
                 )
+            for web_ref in claim.get("web_refs", []):
+                if isinstance(web_ref, dict):
+                    claim_edges.append(
+                        {
+                            "claim_ref": claim_ref,
+                            "round_id": web_ref.get("round_id"),
+                            "search_id": web_ref.get("search_id"),
+                            "kind": "web_ref",
+                        }
+                    )
 
     graph = {
         "session_slug": slug,
         "generation_id": active_generation_id,
         "query_nodes": query_nodes,
+        "web_nodes": web_nodes,
+        "web_recall_nodes": web_recall_nodes,
         "evaluation_nodes": evaluation_nodes,
         "claim_edges": claim_edges,
         "known_query_refs": sorted({"%s:%s" % ref for ref in known_query_refs}),
+        "known_web_refs": sorted({"%s:%s" % ref for ref in known_web_refs}),
         "known_evaluation_refs": sorted(known_eval_refs),
     }
     persist_artifact(
@@ -421,11 +466,17 @@ def run_protocol_audit(slug: str, *, session_id: str | None = None) -> dict[str,
         for ref in graph.get("known_query_refs", [])
         if isinstance(ref, str) and ":" in ref
     }
+    known_web_refs = {
+        tuple(ref.split(":", 1))
+        for ref in graph.get("known_web_refs", [])
+        if isinstance(ref, str) and ":" in ref
+    }
     known_eval_refs = {
         ref for ref in graph.get("known_evaluation_refs", []) if isinstance(ref, str)
     }
 
     query_count = sum(len(bundle.get("executed_queries", [])) for bundle in round_bundles if isinstance(bundle, dict))
+    web_count = sum(len(bundle.get("executed_web_searches", [])) for bundle in round_bundles if isinstance(bundle, dict))
     execution_tool_usage_count = sum(
         1
         for item in trace.get("tool_usages", [])
@@ -437,6 +488,14 @@ def run_protocol_audit(slug: str, *, session_id: str | None = None) -> dict[str,
             events,
             severity="soft_deviation",
             message="Some executed queries do not have a matching tool usage envelope.",
+            ref="protocol_trace.tool_usages",
+        )
+    if web_count > 0 and execution_tool_usage_count == 0:
+        unattributed_actions.append("web_search_without_tool_usage_envelope")
+        _append_event(
+            events,
+            severity="soft_deviation",
+            message="Some executed web searches do not have a matching tool usage envelope.",
             ref="protocol_trace.tool_usages",
         )
 
@@ -463,8 +522,9 @@ def run_protocol_audit(slug: str, *, session_id: str | None = None) -> dict[str,
             continue
         claim_ref = str(claim.get("claim_ref") or claim.get("claim") or "unsupported_claim")
         query_refs = claim.get("query_refs", [])
+        web_refs = claim.get("web_refs", [])
         evaluation_refs = claim.get("evaluation_refs", [])
-        if not query_refs and not evaluation_refs:
+        if not query_refs and not web_refs and not evaluation_refs:
             claims_without_lineage.append(claim_ref)
             continue
         for query_ref in query_refs:
@@ -474,6 +534,11 @@ def run_protocol_audit(slug: str, *, session_id: str | None = None) -> dict[str,
                 break
         for evaluation_ref in evaluation_refs:
             if evaluation_ref not in known_eval_refs:
+                claims_without_lineage.append(claim_ref)
+                break
+        for web_ref in web_refs:
+            ref_tuple = (web_ref.get("round_id"), web_ref.get("search_id")) if isinstance(web_ref, dict) else None
+            if not ref_tuple or ref_tuple not in known_web_refs:
                 claims_without_lineage.append(claim_ref)
                 break
 
@@ -493,6 +558,7 @@ def run_protocol_audit(slug: str, *, session_id: str | None = None) -> dict[str,
             (len(final_answer.get("supported_claims", [])) if isinstance(final_answer, dict) else 0) - len(claims_without_lineage),
         ),
         "executed_queries": query_count,
+        "executed_web_searches": web_count,
         "tool_usage_envelopes": len(trace.get("tool_usages", [])),
     }
 

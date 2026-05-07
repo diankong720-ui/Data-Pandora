@@ -456,6 +456,8 @@ def persist_round_bundle(
     executed_queries: list[dict[str, Any]],
     evaluation: dict[str, Any],
     *,
+    executed_web_searches: list[dict[str, Any]] | None = None,
+    web_recall_assessments: list[dict[str, Any]] | None = None,
     generation_id: str | None = None,
     session_id: str | None = None,
     strict_session: bool = False,
@@ -472,6 +474,8 @@ def persist_round_bundle(
         "generation_id": resolved_generation_id,
         "contract": contract,
         "executed_queries": executed_queries,
+        "executed_web_searches": executed_web_searches or [],
+        "web_recall_assessments": web_recall_assessments or [],
         "evaluation": evaluation,
     }
     return persist_artifact(
@@ -602,6 +606,8 @@ def load_session_evidence(
             strict_session=strict_session,
             legacy_layout=legacy_layout,
         ),
+        "chart_affordances": read_artifact(slug, "chart_affordances.json", session_id=session_id, strict_session=strict_session, legacy_layout=legacy_layout),
+        "chart_compile_report": read_artifact(slug, "chart_compile_report.json", session_id=session_id, strict_session=strict_session, legacy_layout=legacy_layout),
         "chart_spec_bundle": read_artifact(slug, "chart_spec_bundle.json", session_id=session_id, strict_session=strict_session, legacy_layout=legacy_layout),
         "descriptive_stats": read_artifact(slug, "descriptive_stats.json", session_id=session_id, strict_session=strict_session, legacy_layout=legacy_layout),
         "visualization_manifest": read_artifact(slug, "visualization_manifest.json", session_id=session_id, strict_session=strict_session, legacy_layout=legacy_layout),
